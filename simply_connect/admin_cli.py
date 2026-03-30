@@ -1097,37 +1097,37 @@ def admin_main() -> None:
     # publish-minpaku
     publish_parser = subparsers.add_parser(
         "publish-minpaku",
-        help="Compatibility helper: publish an approved Minpaku listing draft through the active domain extension",
+        help="Compatibility helper: publish a Minpaku listing draft through the active domain extension",
     )
     publish_parser.add_argument(
         "entry_id",
         nargs="?",
         default=None,
-        help="Optional approved staging entry ID. Defaults to the latest approved listing draft.",
+        help="Optional staging entry ID. Defaults to the latest listing draft.",
     )
 
     # update-minpaku
     update_parser = subparsers.add_parser(
         "update-minpaku",
-        help="Compatibility helper: update an existing published Minpaku listing using an approved draft",
+        help="Compatibility helper: update an existing published Minpaku listing using a listing draft",
     )
     update_parser.add_argument(
         "entry_id",
         nargs="?",
         default=None,
-        help="Optional approved staging entry ID. Defaults to the latest approved listing draft.",
+        help="Optional staging entry ID. Defaults to the latest listing draft.",
     )
 
     # unlist-minpaku
     delete_parser = subparsers.add_parser(
         "unlist-minpaku",
-        help="Compatibility helper: delete an existing published Minpaku listing using an approved draft",
+        help="Compatibility helper: delete an existing published Minpaku listing using a listing draft",
     )
     delete_parser.add_argument(
         "entry_id",
         nargs="?",
         default=None,
-        help="Optional approved staging entry ID. Defaults to the latest approved listing draft.",
+        help="Optional staging entry ID. Defaults to the latest listing draft.",
     )
 
     # init

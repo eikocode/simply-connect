@@ -3019,8 +3019,8 @@ class TestDecisionPackExtension:
         reply = ext_module.maybe_handle_message("show all listings", cm, role_name="host")
 
         assert "No live listings right now (`count: 0`)." in reply
-        assert "approved local listing draft" in reply
-        assert "publish the latest approved listing" in reply
+        assert "staged listing draft" in reply
+        assert "publish the latest listing draft" in reply
 
         for module_name in list(sys.modules):
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
@@ -3313,7 +3313,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("unlist the latest approved listing", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("unlist the latest listing draft", cm, role_name="operator")
 
         assert "Unlisted `Unit B` from Minpaku." in reply
         assert "list-unit-b" in reply
