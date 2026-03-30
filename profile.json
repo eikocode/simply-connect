@@ -1,0 +1,19 @@
+{
+  "name": "Super-Landlord",
+  "description": "Property management assistant: scan utility bills, generate debit notes, track tenants and properties.",
+  "version": "1.0.0",
+  "context_files": ["properties", "tenants", "utilities", "debit_notes"],
+  "category_map": {
+    "properties": "properties.md",
+    "tenants": "tenants.md",
+    "utilities": "utilities.md",
+    "debit_notes": "debit_notes.md",
+    "general": "properties.md"
+  },
+  "intake_sources": {
+    "business-info.md": {"category": "properties",  "description": "Property portfolio overview"},
+    "personal-info.md": {"category": "tenants",     "description": "Tenant management preferences"},
+    "current-data.md":  {"category": "utilities",   "description": "Current utility rates and accounts"}
+  },
+  "extensions": []
+}

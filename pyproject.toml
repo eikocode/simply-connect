@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simply-connect"
+version = "0.1.0"
+description = "AI-powered assistant with committed context, swappable domain profiles, document ingestion, and multiple surfaces (CLI, Telegram, WebMCP)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "python-dotenv",
+    "requests",
+    "httpx",
+    "mcp",
+    "starlette",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "black", "mypy", "ruff"]
+pdf = ["pypdf"]
+docling = ["docling>=2.0"]
+local-ingest = ["pypdf", "docling>=2.0"]
+
+[project.scripts]
+simply-connect = "simply_connect.cli:main"
+sc = "simply_connect.cli:main"
+simply-connect-admin = "simply_connect.admin_cli:admin_main"
+sc-admin = "simply_connect.admin_cli:admin_main"
+sc-relay = "simply_connect.relay:main"
+sc-mcp = "simply_connect.mcp_server:main"
+
+# Legacy aliases for backward compatibility
+super-contract = "simply_connect.cli:main"
+super-contract-admin = "simply_connect.admin_cli:admin_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["simply_connect*"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
