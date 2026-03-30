@@ -113,6 +113,49 @@ _DEFAULT_STARTER_PROMPTS = {
 }
 
 
+def _iter_property_titles(markdown: str) -> list[str]:
+    titles: list[str] = []
+    for block in re.split(r"(?=^##\s+)", markdown or "", flags=re.MULTILINE):
+        block = block.strip()
+        if not block.startswith("## "):
+            continue
+        first = block.splitlines()[0].replace("##", "", 1).strip()
+        if first:
+            titles.append(first)
+    return titles
+
+
+def _normalize_property_ref(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _parse_property_removal_request(content: str) -> dict[str, str | None]:
+    heading = re.search(r"^##\s+Property Removal Request$", content or "", re.MULTILINE)
+    target = re.search(r"^- Property:\s*`?(.+?)`?$", content or "", re.MULTILINE)
+    full_address = re.search(r"^- Full service address:\s*`?(.+?)`?$", content or "", re.MULTILINE)
+    return {
+        "is_removal": "yes" if heading else None,
+        "property_ref": target.group(1).strip() if target else None,
+        "full_address": full_address.group(1).strip() if full_address else None,
+    }
+
+
+def _property_matches_removal_target(committed_title: str, removal_target: str) -> bool:
+    committed = committed_title.strip().lower()
+    target = removal_target.strip().lower()
+    return committed == target or committed.startswith(target + ",") or target in committed
+
+
+def _looks_like_debit_note(text: str) -> bool:
+    haystack = text or ""
+    lowered = haystack.lower()
+    if "debit note" in lowered:
+        return True
+    if re.search(r"\bdn-\d{4}-\d+\b", haystack, re.IGNORECASE):
+        return True
+    return False
+
+
 def _load_profile(root: Path) -> dict:
     """Load profile.json from project root. Returns built-in defaults if absent or invalid."""
     path = root / "profile.json"
@@ -256,6 +299,57 @@ class ContextManager:
                 result[stem] = ""
         return result
 
+    def build_working_set_snapshot(self, role_name: str | None = None) -> dict[str, Any]:
+        """Return a lightweight working-set overlay for model fallback."""
+        if role_name and self.roles and role_name in self.roles:
+            context = self.load_context_for_role(role_name)
+        else:
+            context = self.load_all_context()
+
+        committed = context.get("committed", {})
+        staging = context.get("staging", [])
+
+        committed_properties = _iter_property_titles(committed.get("properties", ""))
+        pending_property_additions: list[dict[str, str]] = []
+        pending_property_removals: list[dict[str, str]] = []
+
+        for entry in staging:
+            if entry.get("category") != "properties":
+                continue
+            content = str(entry.get("content") or "")
+            parsed_removal = _parse_property_removal_request(content)
+            if parsed_removal.get("is_removal") == "yes" and parsed_removal.get("property_ref"):
+                pending_property_removals.append(
+                    {
+                        "entry_id": str(entry.get("id") or ""),
+                        "property_ref": str(parsed_removal.get("property_ref") or ""),
+                        "full_address": str(parsed_removal.get("full_address") or ""),
+                    }
+                )
+                continue
+            title_match = re.search(r"^##\s+(.+)$", content, re.MULTILINE)
+            pending_property_additions.append(
+                {
+                    "entry_id": str(entry.get("id") or ""),
+                    "title": title_match.group(1).strip() if title_match else str(entry.get("summary") or ""),
+                    "summary": str(entry.get("summary") or ""),
+                }
+            )
+
+        active_properties = [
+            title
+            for title in committed_properties
+            if not any(_property_matches_removal_target(title, item["property_ref"]) for item in pending_property_removals)
+        ]
+
+        return {
+            "role": role_name or "operator",
+            "committed_properties": committed_properties,
+            "active_properties": active_properties,
+            "pending_property_additions": pending_property_additions,
+            "pending_property_removals": pending_property_removals,
+        }
+
     def update_committed(self, category: str, content: str) -> bool:
         """
         Append a reviewed content block to the appropriate committed context file.
@@ -293,6 +387,9 @@ class ContextManager:
         Create a new staging entry file.
         Returns the entry id (UUID).
         """
+        if "debit_notes" in self.CATEGORY_MAP and _looks_like_debit_note(f"{summary}\n{content}"):
+            category = "debit_notes"
+
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         timestamp_str = now.strftime("%Y-%m-%dT%H%M%S")

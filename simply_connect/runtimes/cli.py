@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from .base import ClaudeRuntime
 
@@ -163,16 +164,44 @@ class CLIRuntime(ClaudeRuntime):
         self._project_root = project_root or _find_project_root()
         self._agent_md_path = agent_md_path
 
-    def _load_system_prompt(self) -> str:
+    def _build_working_set_snapshot(self) -> dict[str, Any]:
+        from ..context_manager import ContextManager
+
+        cm = ContextManager(root=self._project_root)
+        return cm.build_working_set_snapshot(role_name=self._role_name)
+
+    def _load_system_prompt(self, working_set: dict[str, Any] | None = None) -> str:
         path = self._agent_md_path or (self._project_root / "AGENT.md")
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
+        base = path.read_text(encoding="utf-8") if path.exists() else ""
+        if not working_set:
+            return base
+        snapshot_block = json.dumps(working_set, ensure_ascii=False, indent=2)
+        return (
+            base
+            + "\n\n---\n\n"
+            + "# Domain Working Set (operational overlay for this role)\n\n"
+            + snapshot_block
+            + "\n\nRules:\n"
+            + "- Respect the domain working set. If a committed record is hidden by a pending staged removal,\n"
+            + "  do not treat it as actionable just because it still exists in committed context.\n"
+            + "- If the request is incomplete or ambiguous, ask a short clarifying question instead of\n"
+            + "  silently choosing a hidden or inactive record.\n"
+        )
+
+    def _compose_user_message(self, user_message: str, working_set: dict[str, Any]) -> str:
+        snapshot_block = json.dumps(working_set, ensure_ascii=False, indent=2)
+        return (
+            "# Current Domain Working Set\n"
+            f"{snapshot_block}\n\n"
+            "Use this working-set overlay for this turn. Hidden records are not actionable.\n\n"
+            f"User request: {user_message}"
+        )
 
     def call(self, user_message: str, user_id: int) -> str:
         """Send a message to claude subprocess and return the reply."""
         mcp_config = _mcp_config_path(self._project_root, self._role_name)
         session_id = _sessions.get(user_id)
+        working_set = self._build_working_set_snapshot()
 
         cmd = [
             "claude",
@@ -185,11 +214,11 @@ class CLIRuntime(ClaudeRuntime):
         if session_id:
             cmd += ["--resume", session_id]
         else:
-            system_prompt = self._load_system_prompt()
+            system_prompt = self._load_system_prompt(working_set=working_set)
             if system_prompt.strip():
                 cmd += ["--system-prompt", system_prompt]
 
-        cmd += ["--", user_message]
+        cmd += ["--", self._compose_user_message(user_message, working_set)]
 
         try:
             result = subprocess.run(

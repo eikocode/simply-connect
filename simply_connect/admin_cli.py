@@ -382,6 +382,7 @@ def _find_aios_context(project_root: Path) -> Path | None:
 def ingest_to_staging(cm, filepath: Path) -> dict:
     """Ingest a document file into staging and return a structured result."""
     from simply_connect.ingestion import ingest_document
+    from simply_connect.ext_loader import load_active_extensions
 
     if not filepath.exists():
         return {
@@ -436,12 +437,22 @@ def ingest_to_staging(cm, filepath: Path) -> dict:
             "entries": [],
         }
 
-    return {
+    final_result = {
         "ok": True,
         "filepath": str(filepath),
         "filename": filepath.name,
         "entries": created_entries,
     }
+
+    for ext in load_active_extensions(cm):
+        hook = getattr(ext["module"], "on_ingest_to_staging", None)
+        if not callable(hook):
+            continue
+        hook_result = hook(cm, filepath, final_result)
+        if hook_result:
+            final_result.setdefault("post_ingest", []).append(hook_result)
+
+    return final_result
 
 
 def cmd_ingest(cm, filepath: Path) -> None:
@@ -460,6 +471,12 @@ def cmd_ingest(cm, filepath: Path) -> None:
         print(f"  Staged ({item['category']}): {item['summary']}")
         print(f"  Entry ID: {item['entry_id'][:8]}...")
         print()
+
+    for hook_result in result.get("post_ingest", []):
+        message = hook_result.get("message")
+        if message:
+            print(f"  ↳ {message}")
+            print()
 
     print(f"  {len(entries)} staging entr{'y' if len(entries) == 1 else 'ies'} created.")
     print("  Run sc-admin review to approve and commit.")

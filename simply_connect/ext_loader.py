@@ -103,11 +103,11 @@ def dispatch_extension_tool(name: str, args: dict, cm) -> str:
     raise ValueError(f"No extension handles tool: {name}")
 
 
-def maybe_handle_message(message: str, cm, role_name: str = "operator") -> str | None:
+def maybe_handle_message(message: str, cm, role_name: str = "operator", history: list[dict] | None = None) -> str | None:
     """Give active extensions a chance to deterministically handle a raw user message.
 
     Extensions can optionally expose:
-        maybe_handle_message(message: str, cm, role_name: str = "operator") -> str | None
+        maybe_handle_message(message: str, cm, role_name: str = "operator", history: list[dict] | None = None) -> str | None
 
     Returns the first non-empty string result, or None when no extension claims the
     message.
@@ -116,7 +116,10 @@ def maybe_handle_message(message: str, cm, role_name: str = "operator") -> str |
         handler = getattr(ext["module"], "maybe_handle_message", None)
         if handler is None:
             continue
-        result = handler(message, cm, role_name=role_name)
+        try:
+            result = handler(message, cm, role_name=role_name, history=history)
+        except TypeError:
+            result = handler(message, cm, role_name=role_name)
         if result:
             return result
     return None

@@ -18,12 +18,23 @@ load_dotenv(override=False)
 
 
 class Config:
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    TELEGRAM_BOT_TOKEN: str = os.getenv("SC_TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_ALLOWED_USERS: str = os.getenv("SC_TELEGRAM_ALLOWED_USERS", "")
-    SC_DATA_DIR: str = os.getenv("SC_DATA_DIR", "")
-    CLAUDE_RUNTIME: str = os.getenv("SC_CLAUDE_RUNTIME", "sdk")
-    DOCUMENT_PARSER: str = os.getenv("SC_DOCUMENT_PARSER", "claude")
+    ANTHROPIC_API_KEY: str = ""
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ALLOWED_USERS: str = ""
+    SC_DATA_DIR: str = ""
+    CLAUDE_RUNTIME: str = "sdk"
+    DOCUMENT_PARSER: str = "claude"
+
+    def __init__(self) -> None:
+        self.reload()
+
+    def reload(self) -> None:
+        self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+        self.TELEGRAM_BOT_TOKEN = os.getenv("SC_TELEGRAM_BOT_TOKEN", "")
+        self.TELEGRAM_ALLOWED_USERS = os.getenv("SC_TELEGRAM_ALLOWED_USERS", "")
+        self.SC_DATA_DIR = os.getenv("SC_DATA_DIR", "")
+        self.CLAUDE_RUNTIME = os.getenv("SC_CLAUDE_RUNTIME", "sdk")
+        self.DOCUMENT_PARSER = os.getenv("SC_DOCUMENT_PARSER", "claude")
 
     def allowed_users(self) -> list[int]:
         """Return list of allowed Telegram user IDs. Empty means all allowed."""

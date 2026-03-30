@@ -115,6 +115,7 @@ def main() -> None:
     # Initialise
     cm = ContextManager(root=args.data_dir)
     load_dotenv(cm._root / ".env", override=True)
+    config.reload()
 
     # Resolve role
     role_name = args.role or "operator"
@@ -218,6 +219,10 @@ def main() -> None:
                     ]
                     for item in result.get("entries", []):
                         lines.append(f"- Staged ({item['category']}): {item['summary']}")
+                    for hook_result in result.get("post_ingest", []):
+                        message = hook_result.get("message")
+                        if message:
+                            lines.extend(["", f"- {message}"])
                     lines.extend(
                         [
                             "",
@@ -242,7 +247,7 @@ def main() -> None:
             if cm.active_extensions:
                 from simply_connect.ext_loader import maybe_handle_message
 
-                direct_result = maybe_handle_message(user_input, cm, role_name=role_prefix)
+                direct_result = maybe_handle_message(user_input, cm, role_name=role_prefix, history=history)
                 if direct_result:
                     result = {
                         "reply": direct_result,
@@ -276,6 +281,7 @@ def main() -> None:
                 from simply_connect.ext_loader import get_all_tools, dispatch_extension_tool
 
                 ext_tools = get_all_tools(cm)
+                working_set = cm.build_working_set_snapshot(role_name=role_name)
 
                 def dispatch_fn(name: str, args: dict) -> str:
                     import json as _json
@@ -303,6 +309,7 @@ def main() -> None:
                 result = brain.respond_with_tools(
                     message=user_input,
                     context=context,
+                    working_set=working_set,
                     tools=ext_tools,
                     dispatch_fn=dispatch_fn,
                     history=history,
@@ -311,9 +318,11 @@ def main() -> None:
                 )
             else:
                 # Send to brain
+                working_set = cm.build_working_set_snapshot(role_name=role_name)
                 result = brain.respond(
                     message=user_input,
                     context=context,
+                    working_set=working_set,
                     history=history,
                     role=role_prefix,
                     agent_md_path=agent_md_path,

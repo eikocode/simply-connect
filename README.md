@@ -177,6 +177,33 @@ When active, the SDK runtime runs a tool-use loop so the agent can call live-dat
 
 The `decision-pack` domain uses this mechanism to expose its extracted shared-submission services through a local extension package in initialized projects.
 
+### Routing Model
+
+Inside a domain deployment, `sc` handles messages in two steps:
+
+1. **Deterministic domain handling first**
+   - Active extensions can expose `maybe_handle_message(...)`.
+   - Use this for stable, high-confidence commands such as:
+     - `mark Unit A available in Minpaku`
+     - `show outstanding debit notes for Unit A`
+     - `confirm booking bk-123 after payment verified`
+   - Deterministic handlers should stay code-driven:
+     - regex / string matching
+     - direct context reads
+     - direct API calls
+     - deterministic parsing of prior session turns
+   - They should not call a model internally.
+
+2. **Domain-aware model fallback second**
+   - If no deterministic handler claims the message, `sc` falls back to the deployment's normal role-aware assistant path.
+   - That path may use the configured runtime/model, but it remains scoped to the active domain, role, tools, and context.
+
+There is usually no separate generic third fallback. Inside a domain deployment, the fallback should still be domain-aware rather than becoming a cross-domain general assistant.
+
+The contract is simple:
+- deterministic handler returns a reply string -> use it and stop
+- deterministic handler returns `None` -> continue to the domain-aware model path
+
 ### Minpaku extension
 
 Tools: `list_properties`, `search_properties`, `get_bookings_by_property`

@@ -4,6 +4,7 @@ Tests for ContextManager — three-layer context architecture.
 These tests use temporary directories and do not require an API key.
 """
 
+import json
 import pytest
 from pathlib import Path
 
@@ -83,6 +84,43 @@ class TestCreateStagingEntry:
         )
         files = list((project_root / "staging").glob("*.md"))
         assert any("payment-terms-net-30" in f.name for f in files)
+
+    def test_normalizes_debit_note_like_capture_to_debit_notes_when_supported(self, tmp_path):
+        from simply_connect.context_manager import ContextManager
+
+        (tmp_path / "AGENT.md").write_text("# Test AGENT.md\n")
+        ctx = tmp_path / "context"
+        ctx.mkdir()
+        for stem in ["properties", "tenants", "utilities", "debit_notes"]:
+            (ctx / f"{stem}.md").write_text(f"# {stem.capitalize()}\n\n[empty]\n")
+        (tmp_path / "staging").mkdir()
+        (tmp_path / "profile.json").write_text(
+            json.dumps(
+                {
+                    "name": "Super-Landlord",
+                    "context_files": ["properties", "tenants", "utilities", "debit_notes"],
+                    "category_map": {
+                        "properties": "properties.md",
+                        "tenants": "tenants.md",
+                        "utilities": "utilities.md",
+                        "debit_notes": "debit_notes.md",
+                        "contracts": "debit_notes.md",
+                    },
+                }
+            )
+        )
+
+        cm = ContextManager(root=tmp_path)
+        cm.create_staging_entry(
+            summary="Record debit note DN-2026-001 as issued",
+            content="## Debit Note\n- Reference: `DN-2026-001`\n- Amount due: `HKD 744.00`\n",
+            category="contracts",
+            source="operator",
+        )
+
+        entries = cm.list_staging()
+        assert len(entries) == 1
+        assert entries[0]["category"] == "debit_notes"
 
 
 class TestListStaging:

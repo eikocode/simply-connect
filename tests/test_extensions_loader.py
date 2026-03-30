@@ -293,6 +293,38 @@ class TestMaybeHandleMessage:
         cm = ContextManager(root=project_root)
         assert maybe_handle_message("please claim this", cm) == "claimed by extension"
 
+    def test_passes_history_to_extension_message_handler_when_supported(self, project_root):
+        profile = {
+            "name": "Legacy",
+            "context_files": ["business"],
+            "category_map": {"business": "business.md", "general": "business.md"},
+            "intake_sources": {},
+            "extensions": ["legacyext"],
+        }
+        (project_root / "profile.json").write_text(json.dumps(profile))
+        extension_dir = project_root / "extension"
+        extension_dir.mkdir()
+        (extension_dir / "tools.py").write_text(
+            "TOOLS = []\n"
+            "def dispatch(name, args, cm):\n"
+            "    raise ValueError(name)\n"
+            "def maybe_handle_message(message, cm, role_name='operator', history=None):\n"
+            "    if 'claim' in message:\n"
+            "        return history[-1]['content'] if history else 'no-history'\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import maybe_handle_message
+
+        cm = ContextManager(root=project_root)
+        assert maybe_handle_message(
+            "please claim this",
+            cm,
+            history=[{"role": "assistant", "content": "draft"}],
+        ) == "draft"
+
 
 class TestDecisionPackExtension:
     def test_decision_pack_extension_loads_from_initialized_project(self, tmp_path):
@@ -752,6 +784,870 @@ class TestDecisionPackExtension:
         review = ext_module.review_staging_entry(cm, entries[0])
         assert review["recommendation"] == "approve"
         assert "already been synced to Minpaku" in review["reason"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_operator_message_accepts_as_available_in_minpaku_variant(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class FakeClient:
+            def create_property(self, payload):
+                assert payload["title"] == "12 Harbour View Road, Unit A & B"
+                return {"success": True, "property": {"id": "prop-sla-variant"}}
+
+        monkeypatch.setattr(ext_module, "SuperLandlordMinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_DEFAULT_HOST_ID", "host-sla-1")
+
+        reply = ext_module.maybe_handle_message(
+            "mark Unit A as available in minpaku",
+            cm,
+            role_name="operator",
+        )
+
+        entries = cm.list_staging(status="unconfirmed")
+        assert len(entries) == 1
+        assert reply is not None
+        assert "12 Harbour View Road, Unit A & B" in reply
+        assert "prop-sla-variant" in reply
+        assert "Staged and synced — run sc-admin review to commit." in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_handoff_returns_explicit_error_when_immediate_sync_fails(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        monkeypatch.setattr(
+            ext_module,
+            "_stage_immediate_handoff",
+            lambda cm, source_property_ref, availability, landlord_note=None: (_ for _ in ()).throw(RuntimeError("Minpaku 422")),
+        )
+
+        reply = ext_module.maybe_handle_message("mark 12 Harbour View Road available for Minpaku", cm, role_name="operator")
+
+        assert "immediate Minpaku handoff failed" in reply
+        assert "Minpaku 422" in reply
+        assert cm.list_staging(status="unconfirmed") == []
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_outstanding_debit_notes_reports_pending_staged_entry(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "debit_notes.md").write_text(
+            "# Debit Notes\n\n## Issued\n\n_None yet._\n\n## Next reference number: DN-2026-001\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        entry_id = cm.create_staging_entry(
+            summary="Issued debit note DN-2026-001 for Sarah Wong (Unit A), HKD 744.00",
+            content=(
+                "Issued debit note `DN-2026-001` for Sarah Wong (Unit A), HKD 744.00, "
+                "Jan-Feb 2026 water charge.\n"
+                "Next reference number advanced to `DN-2026-002`.\n"
+            ),
+            category="debit_notes",
+            source="operator",
+        )
+
+        ext_module = load_active_extensions(cm)[0]["module"]
+        reply = ext_module.maybe_handle_message(
+            "Show outstanding debit notes for Unit A",
+            cm,
+            role_name="operator",
+        )
+
+        assert reply is not None
+        assert "There are no committed outstanding debit notes for Unit A yet." in reply
+        assert "Pending staged debit-note updates for Unit A:" in reply
+        assert f"staging entry `{entry_id}`" in reply
+        assert "sc-admin review" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_outstanding_debit_notes_returns_none_when_no_match_exists(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "debit_notes.md").write_text(
+            "# Debit Notes\n\n## Issued\n\n_None yet._\n\n## Next reference number: DN-2026-001\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+        reply = ext_module.maybe_handle_message(
+            "Show outstanding debit notes for Unit Z",
+            cm,
+            role_name="operator",
+        )
+
+        assert reply is None
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_outstanding_debit_notes_finds_generic_staged_debit_note_update(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "debit_notes.md").write_text(
+            "# Debit Notes\n\n## Issued\n\n_None yet._\n\n## Next reference number: DN-2026-001\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        entry_id = cm.create_staging_entry(
+            summary="Recorded debit note DN-2026-001 for Sarah Wong (Unit A)",
+            content=(
+                "Issued debit note `DN-2026-001` for Sarah Wong (Unit A), amount `HKD 744.00`.\n"
+                "Next debit note reference advanced to `DN-2026-002`.\n"
+            ),
+            category="general",
+            source="operator",
+        )
+
+        ext_module = load_active_extensions(cm)[0]["module"]
+        reply = ext_module.maybe_handle_message(
+            "Show outstanding debit notes for Unit A",
+            cm,
+            role_name="operator",
+        )
+
+        assert reply is not None
+        assert "Pending staged debit-note updates for Unit A:" in reply
+        assert f"staging entry `{entry_id}`" in reply
+        assert "category `debit_notes`" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_can_record_latest_debit_note_draft_into_debit_notes_staging(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+        history = [
+            {
+                "role": "assistant",
+                "content": (
+                    "**Debit Note Draft**\n"
+                    "- `Reference`: DN-2026-001\n"
+                    "- `Issue date`: 2026-03-30\n"
+                    "- `Property`: 12 Harbour View Road, Unit A & B\n"
+                    "- `Billed to`: Sarah Wong (Unit A)\n"
+                    "- `Utility`: Water (Water Supplies Department, Account WSB-2024-8821)\n"
+                    "- `Billing period`: Jan-Feb 2026\n"
+                    "- `Amount due from Unit A`: **HKD 744.00**\n"
+                ),
+            }
+        ]
+
+        reply = ext_module.maybe_handle_message(
+            "record the debit note as issued and stage only the context update for framework approval",
+            cm,
+            role_name="operator",
+            history=history,
+        )
+
+        entries = cm.list_staging(status="unconfirmed")
+        assert reply is not None
+        assert len(entries) == 1
+        assert entries[0]["category"] == "debit_notes"
+        assert "## DN-2026-001" in entries[0]["content"]
+        assert "- Amount: HKD 744.00" in entries[0]["content"]
+        assert "## Next reference number: DN-2026-002" in entries[0]["content"]
+        assert "Mark `DN-2026-001` as issued" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_can_record_generated_fenced_debit_note_into_debit_notes_staging(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+        history = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Generated — here is the debit note draft for Unit A based on the latest committed water bill.\n\n"
+                    "```text\n"
+                    "DEBIT NOTE\n\n"
+                    "Reference No.: DN-2026-001\n"
+                    "Date: 2026-03-30\n\n"
+                    "To: Sarah Wong\n"
+                    "Unit: Unit A\n\n"
+                    "Property / Service Account:\n"
+                    "Harbour View Road\n"
+                    "Water Supplies Department\n"
+                    "Account No.: WSB-2024-8821\n\n"
+                    "Billing Period: Jan-Feb 2026\n"
+                    "Utility: Water\n\n"
+                    "Amount Due: HKD 744.00\n"
+                    "```\n"
+                ),
+            }
+        ]
+
+        reply = ext_module.maybe_handle_message(
+            "record the debit note as issued and stage only the context update for framework approval",
+            cm,
+            role_name="operator",
+            history=history,
+        )
+
+        entries = cm.list_staging(status="unconfirmed")
+        assert reply is not None
+        assert len(entries) == 1
+        assert entries[0]["category"] == "debit_notes"
+        assert "## DN-2026-001" in entries[0]["content"]
+        assert "- Tenant: Sarah Wong" in entries[0]["content"]
+        assert "- Amount: HKD 744.00" in entries[0]["content"]
+        assert "Mark `DN-2026-001` as issued" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_record_debit_note_returns_none_when_no_recent_draft_matches(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        reply = ext_module.maybe_handle_message(
+            "record the debit note as issued and stage only the context update for framework approval",
+            cm,
+            role_name="operator",
+            history=[{"role": "assistant", "content": "No debit note draft was created here."}],
+        )
+
+        assert reply is None
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_record_debit_note_returns_explicit_error_when_staging_write_fails(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        monkeypatch.setattr(ext_module, "_stage_issued_debit_note_from_history", lambda cm, history: (_ for _ in ()).throw(RuntimeError("disk full")))
+
+        reply = ext_module.maybe_handle_message(
+            "record the debit note as issued and stage only the context update for framework approval",
+            cm,
+            role_name="operator",
+            history=[
+                {
+                    "role": "assistant",
+                    "content": (
+                        "```text\n"
+                        "DEBIT NOTE\n\n"
+                        "Reference No.: DN-2026-001\n"
+                        "Date: 2026-03-30\n\n"
+                        "To: Sarah Wong\n"
+                        "Property / Service Account:\n"
+                        "Harbour View Road\n"
+                        "Billing Period: Jan-Feb 2026\n"
+                        "Utility: Water\n"
+                        "Amount Due: HKD 744.00\n"
+                        "```\n"
+                    ),
+                }
+            ],
+        )
+
+        assert "staging the issued-note update failed" in reply
+        assert "disk full" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_can_extract_property_from_latest_utility_bill_and_stage_it(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        cm = ContextManager(root=target_root)
+        cm.create_staging_entry(
+            summary="CLP electricity bill for Flat 6, 7/F Tower 2 Harbour Centre - Mar 2026",
+            content=(
+                "- Service address: Flat 6, 7/F Tower 2, Harbour Centre, 8 Hok Cheung Street, Hung Hom, Kowloon\n"
+                "- Total due: HKD 2,150.00\n"
+            ),
+            category="utilities",
+            source="ingest:electricbill.jpeg",
+        )
+
+        ext_module = load_active_extensions(cm)[0]["module"]
+        extract_reply = ext_module.maybe_handle_message(
+            "extract the property from the utility bill",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert extract_reply is not None
+        assert "Flat 6, 7/F Tower 2" in extract_reply
+        assert "Harbour Centre" in extract_reply
+
+        history = [{"role": "assistant", "content": extract_reply}]
+        capture_reply = ext_module.maybe_handle_message(
+            "capture that extracted property record",
+            cm,
+            role_name="operator",
+            history=history,
+        )
+
+        entries = [entry for entry in cm.list_staging(status="unconfirmed") if entry["category"] == "properties"]
+        assert capture_reply is not None
+        assert len(entries) == 1
+        assert "Flat 6, 7/F Tower 2, Harbour Centre" in entries[0]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_extract_property_returns_none_when_no_bill_candidate_exists(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        reply = ext_module.maybe_handle_message(
+            "extract property from the bill to add it",
+            cm,
+            role_name="operator",
+            history=[{"role": "assistant", "content": "No bill was discussed here."}],
+        )
+
+        assert reply is None
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_capture_property_returns_explicit_error_when_staging_fails(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        monkeypatch.setattr(
+            ext_module,
+            "_extract_property_candidate_from_history_or_staging",
+            lambda cm, history: {
+                "property_ref": "Flat 6, 7/F Tower 2, Harbour Centre",
+                "unit": "Flat 6, 7/F Tower 2",
+                "building": "Harbour Centre",
+                "full_address": "Flat 6, 7/F Tower 2, Harbour Centre, 8 Hok Cheung Street, Hung Hom, Kowloon",
+            },
+        )
+        monkeypatch.setattr(ext_module, "_stage_property_candidate", lambda cm, candidate: (_ for _ in ()).throw(RuntimeError("staging unavailable")))
+
+        reply = ext_module.maybe_handle_message(
+            "capture that extracted property record",
+            cm,
+            role_name="operator",
+            history=[{"role": "assistant", "content": "Extracted property from the utility bill"}],
+        )
+
+        assert "property candidate from the utility bill" in reply
+        assert "staging it failed" in reply
+        assert "staging unavailable" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_capture_property_from_bill_returns_none_when_no_candidate_exists(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        reply = ext_module.maybe_handle_message(
+            "capture that property from the bill",
+            cm,
+            role_name="operator",
+            history=[{"role": "assistant", "content": "No property candidate here."}],
+        )
+
+        assert reply is None
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_show_all_properties_includes_pending_staged_properties(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text("# Properties\n\n", encoding="utf-8")
+
+        cm = ContextManager(root=target_root)
+        cm.create_staging_entry(
+            summary="Property record for Flat 6, 7/F Tower 2, Harbour Centre",
+            content=(
+                "## Flat 6, 7/F Tower 2, Harbour Centre\n"
+                "- Source: utility bill extraction\n"
+                "- Unit: Flat 6, 7/F Tower 2\n"
+                "- Building: Harbour Centre\n"
+                "- Full service address: Flat 6, 7/F Tower 2, Harbour Centre, 8 Hok Cheung Street, Hung Hom, Kowloon\n"
+            ),
+            category="properties",
+            source="operator",
+        )
+
+        ext_module = load_active_extensions(cm)[0]["module"]
+        reply = ext_module.maybe_handle_message(
+            "show all properties",
+            cm,
+            role_name="operator",
+        )
+
+        assert reply is not None
+        assert "Active properties in the operator working set:" in reply
+        assert "`Flat 6, 7/F Tower 2, Harbour Centre` *(pending framework approval)*" in reply
+        assert "Pending staged properties:" in reply
+        assert "Flat 6, 7/F Tower 2, Harbour Centre" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_remove_property_hides_it_from_operator_working_set(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        removal_reply = ext_module.maybe_handle_message(
+            "remove 12 Harbour View Road",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+        assert removal_reply is not None
+        assert "staged the removal" in removal_reply.lower()
+
+        reply = ext_module.maybe_handle_message(
+            "show all properties",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is not None
+        assert "There are currently no active properties in the operator working set." in reply
+        assert "Pending staged properties:" not in reply
+        assert "Pending staged property removals:" in reply
+        assert "12 Harbour View Road" in reply
+
+        pending = cm.list_staging(status="unconfirmed")
+        assert pending
+        assert pending[-1]["category"] == "properties"
+        assert "## Property Removal Request" in pending[-1]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_blocks_debit_note_generation_for_pending_removed_property(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        removal_reply = ext_module.maybe_handle_message(
+            "remove 12 Harbour View",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+        assert removal_reply is not None
+        assert "staged the removal" in removal_reply.lower()
+
+        reply = ext_module.maybe_handle_message(
+            "Generate a debit note for 12 Harbour View",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is not None
+        assert "can't generate a debit note" in reply.lower()
+        assert "pending staged removal" in reply.lower()
+        assert "sc-admin review" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_blocks_incomplete_debit_note_request_when_no_active_properties_remain(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        removal_reply = ext_module.maybe_handle_message(
+            "remove 12 Harbour View",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+        assert removal_reply is not None
+
+        reply = ext_module.maybe_handle_message(
+            "Generate a debit note for",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is not None
+        assert "no active properties in the operator working set" in reply.lower()
+        assert "pending staged property removals:" in reply.lower()
+        assert "sc-admin review" in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_approved_property_removal_cleans_committed_properties_file(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        properties_path = target_root / "context" / "properties.md"
+        properties_path.write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        removal_reply = ext_module.maybe_handle_message(
+            "remove 12 Harbour View",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+        assert removal_reply is not None
+
+        pending = cm.list_staging(status="unconfirmed")
+        entry = pending[-1]
+        assert "## Property Removal Request" in entry["content"]
+
+        assert cm.promote_to_committed(entry["id"], reviewed_by="human") is True
+        result = ext_module.on_staging_approved(cm, entry)
+
+        committed = properties_path.read_text(encoding="utf-8")
+        assert result is not None
+        assert result["ok"] is True
+        assert "Committed property removal applied." in result["message"]
+        assert "12 Harbour View Road, Unit A & B" not in committed
+        assert "## Property Removal Request" not in committed
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_show_all_properties_ignores_committed_removal_request_section(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n\n"
+            "## Property Removal Request\n\n"
+            "- Property: 12 Harbour View Road, Unit A & B\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        reply = ext_module.maybe_handle_message(
+            "show all properties",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is not None
+        assert "12 Harbour View Road, Unit A & B" in reply
+        assert "`Property Removal Request`" not in reply
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_ingest_auto_stages_property_candidate_from_utility_bill(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        bill_path = target_root / "electricbill.jpeg"
+        bill_path.write_text("fake image payload", encoding="utf-8")
+
+        def fake_ingest_document(filepath, committed, profile):
+            assert filepath == bill_path
+            return {
+                "success": True,
+                "extractions": [
+                    {
+                        "summary": "CLP electricity bill for Flat 6, 7/F Tower 2, Harbour Centre - Mar 2026",
+                        "content": (
+                            "- Utility provider: CLP\n"
+                            "- Unit: Flat 6, 7/F Tower 2\n"
+                            "- Building: Harbour Centre\n"
+                            "- Full service address: Flat 6, 7/F Tower 2, Harbour Centre, 8 Hok Cheung Street, Hung Hom, Kowloon\n"
+                        ),
+                        "category": "utilities",
+                    }
+                ],
+            }
+
+        monkeypatch.setattr("simply_connect.ingestion.ingest_document", fake_ingest_document)
+
+        result = admin_cli.ingest_to_staging(cm, bill_path)
+
+        assert result["ok"] is True
+        assert [item["category"] for item in result["entries"]] == ["utilities", "properties"]
+        assert result["post_ingest"]
+        assert "Also staged a property candidate" in result["post_ingest"][0]["message"]
+
+        staged_properties = [entry for entry in cm.list_staging(status="unconfirmed") if entry["category"] == "properties"]
+        assert len(staged_properties) == 1
+        assert "Flat 6, 7/F Tower 2, Harbour Centre" in staged_properties[0]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_remove_property_returns_none_when_reference_is_ambiguous(self, tmp_path):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A\n\n"
+            "- Owner: Andrew Chan\n\n"
+            "## 12 Harbour View Road, Unit B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        reply = ext_module.maybe_handle_message(
+            "remove 12 Harbour View Road",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is None
+        assert cm.list_staging(status="unconfirmed") == []
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
+                del sys.modules[module_name]
+
+    def test_super_landlord_minpaku_handoff_uses_unique_partial_property_match(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+        (target_root / "context" / "properties.md").write_text(
+            "# Properties\n\n"
+            "## 12 Harbour View Road, Unit A & B\n\n"
+            "- Owner: Andrew Chan\n",
+            encoding="utf-8",
+        )
+
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        def fake_stage_immediate_handoff(context_manager, source_property_ref, availability, landlord_note):
+            assert context_manager is cm
+            assert source_property_ref == "12 Harbour View Road, Unit A & B"
+            assert availability == "available"
+            assert landlord_note is None
+            return {
+                "ok": True,
+                "entry_id": "entry-123",
+                "source_property_ref": source_property_ref,
+                "availability": availability,
+                "property_id": "prop-123",
+                "host_id": "host-123",
+                "message": "published immediately",
+            }
+
+        monkeypatch.setattr(ext_module, "_stage_immediate_handoff", fake_stage_immediate_handoff)
+
+        reply = ext_module.maybe_handle_message(
+            "mark 12 Harbour View Road available in minpaku",
+            cm,
+            role_name="operator",
+            history=None,
+        )
+
+        assert reply is not None
+        assert "published immediately" in reply
+        assert "12 Harbour View Road, Unit A & B" in reply
 
         for module_name in list(sys.modules):
             if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
@@ -1429,6 +2325,78 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
+    def test_minpaku_property_removal_returns_none_when_search_is_ambiguous(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "12 Harbour View Road"
+                return [
+                    {"id": "prop-a", "title": "12 Harbour View Road, Unit A"},
+                    {"id": "prop-b", "title": "12 Harbour View Road, Unit B"},
+                ]
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("remove 12 Harbour View Road", cm, role_name="operator")
+
+        assert reply is None
+        assert cm.list_staging(status="unconfirmed") == []
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_removal_accepts_unique_partial_match(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "Harbour View"
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": "Hong Kong, Hong Kong",
+                    "hostId": "host-sla-1",
+                }]
+
+            def get_bookings_by_property(self, property_id):
+                assert property_id == "prop-sla-1"
+                return {"bookings": []}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("remove Harbour View", cm, role_name="operator")
+
+        assert reply is not None
+        assert "Removal request logged to staging" in reply
+        pending = cm.list_staging(status="unconfirmed")
+        assert pending
+        assert pending[-1]["category"] == "properties"
+        assert "12 Harbour View Road, Unit A & B" in pending[-1]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
     def test_minpaku_property_removal_review_hook_approves_when_no_bookings(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
@@ -1467,6 +2435,260 @@ class TestDecisionPackExtension:
         review = ext_module.review_staging_entry(cm, entry)
         assert review["recommendation"] == "approve"
         assert review["confidence"] >= 0.99 - 1e-9
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_price_update_updates_live_property_and_stages_pricing_note(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "Unit A & B"
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": {"city": "Hong Kong", "country": "Hong Kong"},
+                    "currency": "HKD",
+                    "nightlyPrice": 300,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-1",
+                    "amenities": [],
+                    "photos": [],
+                }]
+
+            def update_property(self, property_id, payload):
+                seen["property_id"] = property_id
+                seen["payload"] = payload
+                return {"success": True, "property": {"id": property_id, **payload}}
+
+            def list_listings(self, property_id=None, platform=None, status=None):
+                assert property_id == "prop-sla-1"
+                assert status == "active"
+                return []
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update Unit A & B to $500 /night", cm, role_name="operator")
+
+        assert "updated the live property price" in reply
+        assert seen["property_id"] == "prop-sla-1"
+        assert seen["payload"]["nightlyPrice"] == 500
+        assert seen["payload"]["currency"] == "HKD"
+
+        pending = cm.list_staging(status="unconfirmed")
+        assert pending
+        assert pending[-1]["category"] == "pricing"
+        assert "New nightly price: `HKD 500/night`" in pending[-1]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_max_guests_update_updates_live_property_and_stages_note(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "Unit A & B"
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": {"city": "Hong Kong", "country": "Hong Kong"},
+                    "currency": "HKD",
+                    "nightlyPrice": 300,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-1",
+                    "amenities": [],
+                    "photos": [],
+                }]
+
+            def update_property(self, property_id, payload):
+                seen["property_id"] = property_id
+                seen["payload"] = payload
+                return {"success": True, "property": {"id": property_id, **payload}}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update Unit A & B to have 4 guests", cm, role_name="operator")
+
+        assert "updated the live property" in reply
+        assert seen["property_id"] == "prop-sla-1"
+        assert seen["payload"]["maxGuests"] == 4
+
+        pending = cm.list_staging(status="unconfirmed")
+        assert pending
+        assert pending[-1]["category"] == "properties"
+        assert "- Field updated: `maxGuests`" in pending[-1]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_rules_update_updates_live_property_and_stages_note(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "Unit A & B"
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": {"city": "Hong Kong", "country": "Hong Kong"},
+                    "currency": "HKD",
+                    "nightlyPrice": 300,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-1",
+                    "amenities": [],
+                    "photos": [],
+                    "rules": "No smoking",
+                }]
+
+            def update_property(self, property_id, payload):
+                seen["property_id"] = property_id
+                seen["payload"] = payload
+                return {"success": True, "property": {"id": property_id, **payload}}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update Unit A & B rules to No pets", cm, role_name="operator")
+
+        assert "updated the live property" in reply
+        assert seen["property_id"] == "prop-sla-1"
+        assert seen["payload"]["rules"] == "No pets"
+
+        pending = cm.list_staging(status="unconfirmed")
+        assert pending
+        assert pending[-1]["category"] == "properties"
+        assert "- Field updated: `rules`" in pending[-1]["content"]
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_price_update_falls_back_to_inventory_when_search_returns_empty(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "12 Harbour View Road"
+                return []
+
+            def list_properties(self):
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": {"city": "Hong Kong", "country": "Hong Kong"},
+                    "currency": "HKD",
+                    "nightlyPrice": 300,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-1",
+                    "amenities": [],
+                    "photos": [],
+                }]
+
+            def update_property(self, property_id, payload):
+                seen["property_id"] = property_id
+                seen["payload"] = payload
+                return {"success": True, "property": {"id": property_id, **payload}}
+
+            def list_listings(self, property_id=None, platform=None, status=None):
+                return []
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="operator")
+
+        assert "updated the live property price" in reply
+        assert "inventory fallback" in reply
+        assert seen["property_id"] == "prop-sla-1"
+        assert seen["payload"]["nightlyPrice"] == 400
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_property_price_update_returns_explicit_error_when_live_update_fails(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class FakeClient:
+            def search_properties(self, query):
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": {"city": "Hong Kong", "country": "Hong Kong"},
+                    "currency": "HKD",
+                    "nightlyPrice": 300,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-1",
+                    "amenities": [],
+                    "photos": [],
+                }]
+
+            def update_property(self, property_id, payload):
+                raise RuntimeError("422 Unprocessable Entity")
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="operator")
+
+        assert "live property price update failed" in reply
+        assert "422 Unprocessable Entity" in reply
+        assert cm.list_staging(status="unconfirmed") == []
 
         for module_name in list(sys.modules):
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
@@ -1791,6 +3013,148 @@ class TestDecisionPackExtension:
         assert entry_id in reply
         assert "list-unit-b" in reply
         assert cm.get_staging_entry(entry_id)["status"] == "published"
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_operator_can_publish_named_approved_listing(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        older = cm.create_staging_entry(
+            summary="Minpaku listing draft for Unit A",
+            content=(
+                "## Minpaku Listing Draft — Unit A\n\n"
+                "- Property ID: prop-unit-a\n"
+                "- Source property ref: Unit A\n"
+                "- Platform: airbnb\n"
+                "- Status: active\n\n"
+                "```json\n"
+                "{\n"
+                "  \"propertyId\": \"prop-unit-a\",\n"
+                "  \"title\": \"Unit A\",\n"
+                "  \"description\": \"Draft A.\",\n"
+                "  \"platform\": \"airbnb\",\n"
+                "  \"externalId\": \"unit-a-airbnb\",\n"
+                "  \"nightlyPrice\": 200,\n"
+                "  \"currency\": \"HKD\",\n"
+                "  \"status\": \"active\",\n"
+                "  \"contact\": \"TBD\",\n"
+                "  \"source_property_ref\": \"Unit A\"\n"
+                "}\n"
+                "```\n"
+            ),
+            category="listing_publications",
+            source="operator",
+        )
+        newer = cm.create_staging_entry(
+            summary="Minpaku listing draft for Unit B",
+            content=(
+                "## Minpaku Listing Draft — Unit B\n\n"
+                "- Property ID: prop-unit-b\n"
+                "- Source property ref: Unit B\n"
+                "- Platform: airbnb\n"
+                "- Status: active\n\n"
+                "```json\n"
+                "{\n"
+                "  \"propertyId\": \"prop-unit-b\",\n"
+                "  \"title\": \"Unit B\",\n"
+                "  \"description\": \"Draft B.\",\n"
+                "  \"platform\": \"airbnb\",\n"
+                "  \"externalId\": \"unit-b-airbnb\",\n"
+                "  \"nightlyPrice\": 250,\n"
+                "  \"currency\": \"HKD\",\n"
+                "  \"status\": \"active\",\n"
+                "  \"contact\": \"TBD\",\n"
+                "  \"source_property_ref\": \"Unit B\"\n"
+                "}\n"
+                "```\n"
+            ),
+            category="listing_publications",
+            source="operator",
+        )
+        assert cm.update_staging_status(older, "approved", "human") is True
+        assert cm.update_staging_status(newer, "approved", "human") is True
+
+        class FakeClient:
+            def create_listing(self, payload):
+                assert payload["propertyId"] == "prop-unit-a"
+                return {"id": "list-unit-a", "propertyId": "prop-unit-a", "platform": "airbnb"}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = ext_module.maybe_handle_message("publish listing draft for Unit A", cm, role_name="operator")
+
+        assert reply is not None
+        assert "Published `Unit A` live in Minpaku." in reply
+        assert older in reply
+        assert cm.get_staging_entry(older)["status"] == "published"
+        assert cm.get_staging_entry(newer)["status"] == "approved"
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
+    def test_minpaku_operator_listing_target_returns_none_when_ambiguous(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        first = cm.create_staging_entry(
+            summary="Minpaku listing draft for Harbour View A",
+            content=(
+                "## Minpaku Listing Draft — Harbour View A\n\n"
+                "- Property ID: prop-hv-a\n"
+                "- Source property ref: Harbour View\n"
+                "- Platform: airbnb\n"
+                "- Status: active\n\n"
+                "```json\n"
+                "{\"propertyId\": \"prop-hv-a\", \"title\": \"Harbour View A\", \"description\": \"A\", \"platform\": \"airbnb\", \"status\": \"active\", \"source_property_ref\": \"Harbour View\"}\n"
+                "```\n"
+            ),
+            category="listing_publications",
+            source="operator",
+        )
+        second = cm.create_staging_entry(
+            summary="Minpaku listing draft for Harbour View B",
+            content=(
+                "## Minpaku Listing Draft — Harbour View B\n\n"
+                "- Property ID: prop-hv-b\n"
+                "- Source property ref: Harbour View\n"
+                "- Platform: airbnb\n"
+                "- Status: active\n\n"
+                "```json\n"
+                "{\"propertyId\": \"prop-hv-b\", \"title\": \"Harbour View B\", \"description\": \"B\", \"platform\": \"airbnb\", \"status\": \"active\", \"source_property_ref\": \"Harbour View\"}\n"
+                "```\n"
+            ),
+            category="listing_publications",
+            source="operator",
+        )
+        assert cm.update_staging_status(first, "approved", "human") is True
+        assert cm.update_staging_status(second, "approved", "human") is True
+
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = ext_module.maybe_handle_message("publish listing for Harbour View", cm, role_name="operator")
+
+        assert reply is None
+        assert cm.get_staging_entry(first)["status"] == "approved"
+        assert cm.get_staging_entry(second)["status"] == "approved"
 
         for module_name in list(sys.modules):
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):

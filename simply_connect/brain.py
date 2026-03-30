@@ -187,6 +187,12 @@ def _format_staging(staging: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _format_working_set(working_set: dict[str, Any] | None) -> str:
+    if not working_set:
+        return "(no working-set snapshot)"
+    return json.dumps(working_set, ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # respond() — main operator/admin brain
 # ---------------------------------------------------------------------------
@@ -198,6 +204,7 @@ def respond(
     role: str = "operator",
     agent_md_path: Path | None = None,
     categories: list[str] | None = None,
+    working_set: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Generate a trust-aware response to an operator or admin message.
@@ -223,6 +230,7 @@ def respond(
     committed_block = _format_committed(context.get("committed", {}))
     staging_entries = context.get("staging", [])
     staging_block = _format_staging(staging_entries)
+    working_set_block = _format_working_set(working_set)
     has_staging = bool(staging_entries)
 
     _default_categories = ["business", "parties", "preferences", "contracts", "general"]
@@ -245,6 +253,10 @@ Current session role: {role}
 
 {staging_block}
 
+## Domain Working Set (operational overlay for this role)
+
+{working_set_block}
+
 ---
 
 # Response Instructions
@@ -265,6 +277,15 @@ This includes:
 
 **Explicit capture phrases:** "remember this", "note that", "learn this", "keep this in mind",
 "going forward", "for future reference", "add this to context", "don't forget that"
+
+**Explicit record/issue phrases for a prior draft:** if the operator says "record the debit note as issued",
+"stage only the context update", "record this as issued", or similar phrasing that clearly means
+the latest draft should be persisted as a staged business record, capture that latest draft to staging
+using the matching category (for a debit note draft, use "debit_notes").
+
+**Explicit property-from-bill phrases:** if the operator asks to extract, add, capture, or stage
+the property from the latest utility bill, use the latest utility-bill content in recent history or
+staging to derive a property candidate and capture it as a "properties" staging entry.
 
 **Implicit confirmation of a prior draft:** if the operator says "confirm", "yes", "ok",
 "issue it", "send it", or similar short affirmatives AND the previous assistant turn contained
@@ -291,6 +312,12 @@ When used_unconfirmed is true, append to your reply:
 ## General Rules
 - Never refuse due to missing context. Work with what is available.
 - If context is empty, help the operator and suggest they run sc-admin intake to populate it.
+- Respect the domain working set. If a committed record is hidden by a pending staged removal,
+  do not treat it as actionable just because it still exists in committed context.
+- If the request is incomplete or ambiguous, ask a short clarifying question instead of
+  silently choosing a hidden or inactive record.
+- For debit-note generation or outstanding-debit-note lookup, if the tenant/property target is fuzzy,
+  incomplete, or unmatched, ask for clarification instead of asserting a result from weak substring matches.
 - Keep responses focused on contract work.
 - Be concise and practical — operators are working, not reading essays.
 """
@@ -418,6 +445,7 @@ def respond_with_tools(
     role: str = "operator",
     agent_md_path: Path | None = None,
     categories: list[str] | None = None,
+    working_set: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Generate a response using the tool_use loop — for profiles with active extensions.
@@ -447,7 +475,14 @@ def respond_with_tools(
     """
     if not _api_key():
         # No API key — fall back to respond() which handles subprocess routing
-        return respond(message, context, history=history, role=role, agent_md_path=agent_md_path)
+        return respond(
+            message,
+            context,
+            working_set=working_set,
+            history=history,
+            role=role,
+            agent_md_path=agent_md_path,
+        )
 
     claude = _get_claude()
     agent_instructions = _load_agent_md(agent_md_path)
@@ -455,6 +490,7 @@ def respond_with_tools(
     committed_block = _format_committed(context.get("committed", {}))
     staging_entries = context.get("staging", [])
     staging_block = _format_staging(staging_entries)
+    working_set_block = _format_working_set(working_set)
 
     system_prompt = f"""{agent_instructions}
 
@@ -473,6 +509,10 @@ Current session role: {role}
 
 {staging_block}
 
+## Domain Working Set (operational overlay for this role)
+
+{working_set_block}
+
 ---
 
 # Response Instructions
@@ -485,10 +525,23 @@ When the operator signals capture intent ("remember this", "note that", "learn t
 "don't forget that") — call the capture_to_staging tool with summary, content, and category.
 Append to your reply: "Captured — pending admin review."
 
+If the operator explicitly asks to record or stage the latest debit note / invoice / draft as issued
+for framework approval, treat that as capture intent tied to the latest assistant draft and call
+capture_to_staging with the matching business category (for debit notes, use "debit_notes").
+If the operator explicitly asks to extract, add, capture, or stage the property from the latest
+utility bill, treat that as capture intent tied to the latest utility-bill context and call
+capture_to_staging with category "properties".
+
 When you draw on staging (unconfirmed) context in your reply, append:
 "*(note: drawing on unconfirmed context — pending admin review)*"
 
 Never refuse due to missing context. Work with what is available.
+Respect the domain working set. If a committed record is hidden by a pending staged removal,
+do not treat it as actionable just because it still exists in committed context.
+If the request is incomplete or ambiguous, ask a short clarifying question instead of
+silently choosing a hidden or inactive record.
+For debit-note generation or outstanding-debit-note lookup, if the tenant/property target is fuzzy,
+incomplete, or unmatched, ask for clarification instead of asserting a result from weak substring matches.
 """
 
     # Build initial messages

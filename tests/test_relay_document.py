@@ -21,11 +21,14 @@ import simply_connect.relay  # noqa: F401
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def relay(tmp_path):
+def relay(tmp_path, monkeypatch):
     """TelegramRelay with a fake token; runtime is mocked out."""
+    monkeypatch.setenv("SC_TELEGRAM_ALLOWED_USERS", "")
+    monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
     with patch("simply_connect.relay.get_runtime") as mock_rt:
         mock_rt.return_value = MagicMock()
-        from simply_connect.relay import TelegramRelay
+        from simply_connect.relay import TelegramRelay, config
+        config.reload()
         r = TelegramRelay("fake-token", role_name="operator")
     return r
 

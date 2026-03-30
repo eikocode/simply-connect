@@ -17,12 +17,13 @@ class TestSDKRuntimeDecisionPack:
 
         monkeypatch.chdir(target_root)
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_create_submission" in tool_names
             assert "decision_pack_get_latest_submission" in tool_names
             assert role == "founder"
             assert agent_md_path == target_root / "roles" / "founder" / "AGENT.md"
+            assert working_set["role"] == "founder"
 
             created = json.loads(
                 dispatch_fn(
@@ -78,10 +79,11 @@ class TestSDKRuntimeDecisionPack:
 
         call_counter = {"count": 0}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_get_working_state" in tool_names
             assert role == "founder"
+            assert working_set["role"] == "founder"
             call_counter["count"] += 1
 
             if call_counter["count"] == 1:
@@ -166,11 +168,12 @@ class TestSDKRuntimeDecisionPack:
         monkeypatch.chdir(target_root)
         call_counter = {"count": 0}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_create_and_assess_submission" in tool_names
             assert "decision_pack_process_pricing_change" in tool_names
             assert "decision_pack_review_material_change_hold" in tool_names
+            assert working_set["role"] == role
             call_counter["count"] += 1
 
             if call_counter["count"] == 1:

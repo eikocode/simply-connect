@@ -13,6 +13,7 @@ class TestCliWithExtensions:
         target_root = tmp_path / "decision-pack-project"
         target_root.mkdir()
         admin_cli.cmd_init("decision-pack", target_root, force=False)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
 
         monkeypatch.chdir(target_root)
 
@@ -21,10 +22,11 @@ class TestCliWithExtensions:
 
         called = {"tool_path": False}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, working_set):
             called["tool_path"] = True
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_get_working_state" in tool_names
+            assert working_set["role"] == "founder"
             return {
                 "reply": "Working state is empty; create the first submission.",
                 "capture": None,
@@ -54,6 +56,7 @@ class TestCliWithExtensions:
         target_root = tmp_path / "decision-pack-project"
         target_root.mkdir()
         admin_cli.cmd_init("decision-pack", target_root, force=False)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
 
         monkeypatch.chdir(target_root)
 
@@ -83,6 +86,7 @@ class TestCliWithExtensions:
         target_root = tmp_path / "super-landlord-project"
         target_root.mkdir()
         admin_cli.cmd_init("super-landlord", target_root, force=False)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
         bill_path = target_root / "bill.pdf"
         bill_path.write_text("fake bill", encoding="utf-8")
 
@@ -130,7 +134,7 @@ class TestCliWithExtensions:
         admin_cli.cmd_init("minpaku", target_root, force=False)
 
         monkeypatch.chdir(target_root)
-        monkeypatch.setattr("simply_connect.config.config.CLAUDE_RUNTIME", "cli")
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "cli")
 
         inputs = iter(["List the current properties.", "/quit"])
         monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
@@ -147,7 +151,7 @@ class TestCliWithExtensions:
             assert runtime == "cli"
             assert role_name == "host"
             assert project_root == target_root
-            assert agent_md_path == target_root / "roles" / "host" / "AGENT.md"
+            assert agent_md_path == target_root / "roles" / "operator" / "AGENT.md"
             return FakeRuntime()
 
         def fail_plain_respond(*args, **kwargs):
@@ -192,7 +196,7 @@ class TestCliWithExtensions:
             assert runtime == "opencode"
             assert role_name == "host"
             assert project_root == target_root
-            assert agent_md_path == target_root / "roles" / "host" / "AGENT.md"
+            assert agent_md_path == target_root / "roles" / "operator" / "AGENT.md"
             return FakeRuntime()
 
         def fail_plain_respond(*args, **kwargs):
@@ -239,6 +243,11 @@ class TestCliWithExtensions:
         assert "--allowedTools" in captured["cmd"]
         idx = captured["cmd"].index("--allowedTools")
         assert captured["cmd"][idx + 1] == "mcp__simply-connect"
+        system_idx = captured["cmd"].index("--system-prompt")
+        assert "Domain Working Set" in captured["cmd"][system_idx + 1]
+        assert '"role": "host"' in captured["cmd"][system_idx + 1]
+        assert "# Current Domain Working Set" in captured["cmd"][-1]
+        assert "User request: List the current properties." in captured["cmd"][-1]
 
     def test_cli_runtime_surfaces_structured_claude_error_message(self, tmp_path, monkeypatch):
         from simply_connect.runtimes.cli import CLIRuntime
@@ -385,6 +394,7 @@ class TestCliWithExtensions:
         target_root = tmp_path / "minpaku-project"
         target_root.mkdir()
         admin_cli.cmd_init("minpaku", target_root, force=False)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
 
         cm = ContextManager(root=target_root)
         entry_id = cm.create_staging_entry(
@@ -401,10 +411,11 @@ class TestCliWithExtensions:
 
         seen = {"calls": 0}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, working_set):
             seen["calls"] += 1
             if seen["calls"] == 1:
                 assert role == "host"
+                assert working_set["role"] == "host"
                 assert len(context["staging"]) == 1
                 assert context["staging"][0]["id"] == entry_id
                 cm.update_staging_status(entry_id, "approved", "human")
@@ -447,6 +458,7 @@ class TestCliWithExtensions:
         target_root = tmp_path / "super-landlord-project"
         target_root.mkdir()
         admin_cli.cmd_init("super-landlord", target_root, force=False)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "sdk")
 
         monkeypatch.chdir(target_root)
 
@@ -470,15 +482,17 @@ class TestCliWithExtensions:
     def test_super_landlord_direct_handoff_message_creates_unconfirmed_staging(self, tmp_path, monkeypatch, capsys):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions
 
         target_root = tmp_path / "super-landlord-project"
         target_root.mkdir()
         admin_cli.cmd_init("super-landlord", target_root, force=False)
         baseline_cm = ContextManager(root=target_root)
         baseline_pending = len(baseline_cm.list_staging(status="unconfirmed"))
+        ext_module = load_active_extensions(baseline_cm)[0]["module"]
 
         monkeypatch.chdir(target_root)
-        monkeypatch.setattr("simply_connect.config.config.CLAUDE_RUNTIME", "cli")
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "cli")
 
         inputs = iter(["Mark 12 Harbour View Road, Unit A & B available for Minpaku.", "/quit"])
         monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
@@ -501,9 +515,34 @@ class TestCliWithExtensions:
             called["respond"] = True
             raise AssertionError("Direct handoff intent should not fall through to respond")
 
+        def fake_stage_immediate_handoff(cm, source_property_ref, availability, landlord_note=None):
+            body = "\n".join(
+                [
+                    f"## Minpaku Handoff — {source_property_ref}",
+                    f"- Availability: {availability}",
+                    "- Sync status: published to Minpaku (pending framework review)",
+                ]
+            )
+            entry_id = cm.create_staging_entry(
+                summary=f"Minpaku handoff for {source_property_ref} ({availability})",
+                content=body,
+                category="minpaku_handoffs",
+                source="operator",
+            )
+            return {
+                "ok": True,
+                "entry_id": entry_id,
+                "source_property_ref": source_property_ref,
+                "availability": availability,
+                "property_id": "prop-test-1",
+                "host_id": "host-test-1",
+                "message": f"Made {source_property_ref} available in Minpaku immediately as prop-test-1 using host id host-test-1.",
+            }
+
         monkeypatch.setattr("simply_connect.runtimes.get_runtime", fake_get_runtime)
         monkeypatch.setattr("simply_connect.brain.respond_with_tools", fail_respond_with_tools)
         monkeypatch.setattr("simply_connect.brain.respond", fail_respond)
+        monkeypatch.setattr(ext_module, "_stage_immediate_handoff", fake_stage_immediate_handoff)
 
         from simply_connect.cli import main
 
@@ -511,7 +550,7 @@ class TestCliWithExtensions:
         main()
 
         out = capsys.readouterr().out
-        assert "Handoff staged:" in out
+        assert "Staged and synced" in out
 
         cm = ContextManager(root=target_root)
         pending = cm.list_staging(status="unconfirmed")
@@ -520,3 +559,75 @@ class TestCliWithExtensions:
         assert matching
         assert matching[-1]["category"] == "minpaku_handoffs"
         assert called == {"runtime": False, "respond_with_tools": False, "respond": False}
+
+    def test_cli_prefers_deterministic_extension_handler_before_runtime_fallback(self, tmp_path, monkeypatch, capsys):
+        from simply_connect import admin_cli
+
+        target_root = tmp_path / "super-landlord-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("super-landlord", target_root, force=False)
+
+        monkeypatch.chdir(target_root)
+        monkeypatch.setenv("SC_CLAUDE_RUNTIME", "cli")
+
+        inputs = iter(["show outstanding debit notes for Unit A", "/quit"])
+        monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+
+        called = {"runtime": False}
+
+        class FakeRuntime:
+            def call(self, user_message, user_id):
+                called["runtime"] = True
+                return "runtime should not be used"
+
+        monkeypatch.setattr("simply_connect.runtimes.get_runtime", lambda *args, **kwargs: FakeRuntime())
+        monkeypatch.setattr(
+            "simply_connect.ext_loader.maybe_handle_message",
+            lambda message, cm, role_name="operator", history=None: (
+                "deterministic outstanding debit note reply"
+                if "outstanding debit notes" in message
+                else None
+            ),
+        )
+
+        from simply_connect.cli import main
+
+        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "operator"])
+        main()
+
+        out = capsys.readouterr().out
+        assert "deterministic outstanding debit note reply" in out
+        assert called["runtime"] is False
+
+    def test_cli_falls_back_to_domain_runtime_when_deterministic_handler_returns_none(self, tmp_path, monkeypatch, capsys):
+        from simply_connect import admin_cli
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+
+        monkeypatch.chdir(target_root)
+        monkeypatch.setattr("simply_connect.config.config.CLAUDE_RUNTIME", "cli")
+
+        inputs = iter(["something ambiguous", "/quit"])
+        monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+
+        called = {"runtime": False}
+
+        class FakeRuntime:
+            def call(self, user_message, user_id):
+                called["runtime"] = True
+                assert user_message == "something ambiguous"
+                return "domain-aware runtime fallback"
+
+        monkeypatch.setattr("simply_connect.runtimes.get_runtime", lambda *args, **kwargs: FakeRuntime())
+        monkeypatch.setattr("simply_connect.ext_loader.maybe_handle_message", lambda *args, **kwargs: None)
+
+        from simply_connect.cli import main
+
+        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "operator"])
+        main()
+
+        out = capsys.readouterr().out
+        assert "domain-aware runtime fallback" in out
+        assert called["runtime"] is True

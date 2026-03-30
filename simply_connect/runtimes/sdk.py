@@ -50,6 +50,7 @@ class SDKRuntime(ClaudeRuntime):
             agent_md_path = None
 
         history = self._sm.get_history(session_id)
+        working_set = self._cm.build_working_set_snapshot(role_name=self._role_name)
 
         active_exts = self._cm.active_extensions
 
@@ -90,6 +91,7 @@ class SDKRuntime(ClaudeRuntime):
             result = respond_with_tools(
                 message=user_message,
                 context=context,
+                working_set=working_set,
                 tools=ext_tools,
                 dispatch_fn=dispatch_fn,
                 history=history,
@@ -105,6 +107,7 @@ class SDKRuntime(ClaudeRuntime):
             result = respond(
                 message=user_message,
                 context=context,
+                working_set=working_set,
                 history=history,
                 role=role_prefix,
                 agent_md_path=agent_md_path,

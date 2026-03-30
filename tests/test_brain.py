@@ -216,6 +216,36 @@ class TestRespondWithStaging:
 
         assert result["used_unconfirmed"] is True
 
+    def test_working_set_snapshot_is_included_in_prompt(self, project_root, mock_context):
+        response_json = json.dumps({
+            "reply": "No active properties remain.",
+            "capture": None,
+            "confidence": 0.82,
+            "used_unconfirmed": False,
+            "raw_response": "used working set snapshot",
+        })
+        mock_client = _make_mock_claude(response_json)
+        working_set = {
+            "role": "operator",
+            "committed_properties": ["12 Harbour View Road, Unit A & B"],
+            "active_properties": [],
+            "pending_property_additions": [],
+            "pending_property_removals": [
+                {"entry_id": "entry-1", "property_ref": "12 Harbour View Road, Unit A & B", "full_address": ""}
+            ],
+        }
+
+        with patch("simply_connect.brain._get_claude", return_value=mock_client), \
+             patch("simply_connect.brain._resolve_project_root", return_value=project_root):
+            from simply_connect.brain import respond
+            result = respond("Generate a debit note for", mock_context, working_set=working_set)
+
+        assert result["reply"] == "No active properties remain."
+        system_prompt = mock_client.messages.create.call_args.kwargs["system"]
+        assert "## Domain Working Set (operational overlay for this role)" in system_prompt
+        assert '"active_properties": []' in system_prompt
+        assert '"pending_property_removals"' in system_prompt
+
 
 class TestReviewStagingEntry:
     def test_returns_all_required_keys(self, project_root):
