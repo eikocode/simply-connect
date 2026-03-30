@@ -2037,6 +2037,15 @@ class TestDecisionPackExtension:
         admin_cli.cmd_init("minpaku", target_root, force=False)
 
         cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class DraftClient:
+            def create_listing(self, payload):
+                return {"id": "list-draft-1", "propertyId": payload["propertyId"], "platform": payload["platform"]}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", DraftClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
         staged = json.loads(
             dispatch_extension_tool(
                 "prepare_minpaku_listing",
@@ -2057,8 +2066,6 @@ class TestDecisionPackExtension:
         assert entry is not None
         assert entry["category"] == "listing_publications"
         assert cm.update_staging_status(staged["entry_id"], "approved", "human") is True
-
-        ext_module = load_active_extensions(cm)[0]["module"]
 
         class FakeClient:
             def create_listing(self, payload):
@@ -2182,6 +2189,15 @@ class TestDecisionPackExtension:
         )
 
         cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class DraftClient:
+            def create_listing(self, payload):
+                return {"id": "list-draft-2", "propertyId": payload["propertyId"], "platform": payload["platform"]}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", DraftClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
         staged = json.loads(
             dispatch_extension_tool(
                 "prepare_minpaku_listing",
@@ -2199,8 +2215,6 @@ class TestDecisionPackExtension:
         )
         assert staged["ok"] is True
         assert cm.update_staging_status(staged["entry_id"], "approved", "human") is True
-
-        ext_module = load_active_extensions(cm)[0]["module"]
 
         class FakeClient:
             def update_listing(self, listing_id, payload):
@@ -2694,6 +2708,71 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
+    def test_minpaku_property_price_update_uses_full_property_record_for_live_update(self, tmp_path, monkeypatch):
+        from simply_connect import admin_cli
+        from simply_connect.context_manager import ContextManager
+        from simply_connect.ext_loader import load_active_extensions, maybe_handle_message
+
+        target_root = tmp_path / "minpaku-project"
+        target_root.mkdir()
+        admin_cli.cmd_init("minpaku", target_root, force=False)
+        cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        seen: dict[str, object] = {}
+
+        class FakeClient:
+            def search_properties(self, query):
+                assert query == "12 Harbour View Road"
+                return []
+
+            def list_properties(self):
+                return [{
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "location": "Unit A & B, Unit A & B",
+                    "currency": "HKD",
+                }]
+
+            def get_property(self, property_id):
+                assert property_id == "prop-sla-1"
+                return {
+                    "id": "prop-sla-1",
+                    "title": "12 Harbour View Road, Unit A & B",
+                    "description": "Full ACP property record",
+                    "location": {"city": "Hong Kong", "country": "HK", "coordinates": None},
+                    "currency": "HKD",
+                    "nightlyPrice": 0,
+                    "maxGuests": 1,
+                    "hostId": "host-sla-demo-1",
+                    "amenities": [],
+                    "photos": [],
+                }
+
+            def update_property(self, property_id, payload):
+                seen["property_id"] = property_id
+                seen["payload"] = payload
+                return {"success": True, "property": {"id": property_id, **payload}}
+
+            def list_listings(self, property_id=None, platform=None, status=None):
+                return []
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
+        reply = maybe_handle_message("update 12 Harbour View Road to $300/night", cm, role_name="operator")
+
+        assert "updated the live property price" in reply
+        assert seen["property_id"] == "prop-sla-1"
+        assert seen["payload"]["city"] == "Hong Kong"
+        assert seen["payload"]["country"] == "HK"
+        assert seen["payload"]["hostId"] == "host-sla-demo-1"
+        assert seen["payload"]["nightlyPrice"] == 300
+
+        for module_name in list(sys.modules):
+            if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
+                del sys.modules[module_name]
+
     def test_minpaku_property_removal_approval_executes_backend_delete(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli, brain
         from simply_connect.context_manager import ContextManager
@@ -2775,6 +2854,15 @@ class TestDecisionPackExtension:
         )
 
         cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class DraftClient:
+            def create_listing(self, payload):
+                return {"id": "list-draft-review-1", "propertyId": payload["propertyId"], "platform": payload["platform"]}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", DraftClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
         staged = json.loads(
             dispatch_extension_tool(
                 "prepare_minpaku_listing",
@@ -2789,7 +2877,6 @@ class TestDecisionPackExtension:
             )
         )
         entry = cm.get_staging_entry(staged["entry_id"])
-        ext_module = load_active_extensions(cm)[0]["module"]
 
         class FakeClient:
             def list_listings(self, property_id=None, platform=None, status=None):
@@ -2817,6 +2904,15 @@ class TestDecisionPackExtension:
         admin_cli.cmd_init("minpaku", target_root, force=False)
 
         cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class DraftClient:
+            def create_listing(self, payload):
+                return {"id": "list-draft-review-2", "propertyId": payload["propertyId"], "platform": payload["platform"]}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", DraftClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
         staged = json.loads(
             dispatch_extension_tool(
                 "prepare_minpaku_listing",
@@ -2831,7 +2927,6 @@ class TestDecisionPackExtension:
             )
         )
         entry = cm.get_staging_entry(staged["entry_id"])
-        ext_module = load_active_extensions(cm)[0]["module"]
 
         class FakeClient:
             def list_listings(self, property_id=None, platform=None, status=None):
@@ -3424,6 +3519,15 @@ class TestDecisionPackExtension:
         )
 
         cm = ContextManager(root=target_root)
+        ext_module = load_active_extensions(cm)[0]["module"]
+
+        class DraftClient:
+            def create_listing(self, payload):
+                return {"id": "list-draft-3", "propertyId": payload["propertyId"], "platform": payload["platform"]}
+
+        monkeypatch.setattr(ext_module, "MinpakuClient", DraftClient)
+        monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
+
         staged = json.loads(
             dispatch_extension_tool(
                 "prepare_minpaku_listing",
@@ -3442,8 +3546,6 @@ class TestDecisionPackExtension:
         assert staged["ok"] is True
         assert staged["staged"] is True
         assert cm.update_staging_status(staged["entry_id"], "approved", "human") is True
-
-        ext_module = load_active_extensions(cm)[0]["module"]
 
         class FakeClient:
             def delete_listing(self, listing_id):
