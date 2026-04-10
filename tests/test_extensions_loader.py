@@ -776,7 +776,7 @@ class TestDecisionPackExtension:
         assert len(entries) == 1
         assert reply is not None
         assert "Made 12 Harbour View Road, Unit A & B available in Minpaku immediately as prop-sla-1" in reply
-        assert "Staged and synced — run sc-admin review to commit." in reply
+        assert "Staged and synced — run `sc-admin review` to commit." in reply
         assert "Remote property ID: prop-sla-1" in entries[0]["content"]
         assert "Remote host ID: host-sla-1" in entries[0]["content"]
         assert "Sync status: published to Minpaku (pending framework review)" in entries[0]["content"]
@@ -820,7 +820,7 @@ class TestDecisionPackExtension:
         assert reply is not None
         assert "12 Harbour View Road, Unit A & B" in reply
         assert "prop-sla-variant" in reply
-        assert "Staged and synced — run sc-admin review to commit." in reply
+        assert "Staged and synced — run `sc-admin review` to commit." in reply
 
         for module_name in list(sys.modules):
             if module_name == "_sc_extension_super-landlord.tools" or module_name.startswith("_sc_extension_super-landlord."):
@@ -2361,7 +2361,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("remove 12 Harbour View Road", cm, role_name="operator")
+        reply = maybe_handle_message("remove 12 Harbour View Road", cm, role_name="host")
 
         assert reply is None
         assert cm.list_staging(status="unconfirmed") == []
@@ -2398,7 +2398,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("remove Harbour View", cm, role_name="operator")
+        reply = maybe_handle_message("remove Harbour View", cm, role_name="host")
 
         assert reply is not None
         assert "Removal request logged to staging" in reply
@@ -2495,7 +2495,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update Unit A & B to $500 /night", cm, role_name="operator")
+        reply = maybe_handle_message("update Unit A & B to $500 /night", cm, role_name="host")
 
         assert "updated the live property price" in reply
         assert seen["property_id"] == "prop-sla-1"
@@ -2547,7 +2547,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update Unit A & B to have 4 guests", cm, role_name="operator")
+        reply = maybe_handle_message("update Unit A & B to have 4 guests", cm, role_name="host")
 
         assert "updated the live property" in reply
         assert seen["property_id"] == "prop-sla-1"
@@ -2599,7 +2599,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update Unit A & B rules to No pets", cm, role_name="operator")
+        reply = maybe_handle_message("update Unit A & B rules to No pets", cm, role_name="host")
 
         assert "updated the live property" in reply
         assert seen["property_id"] == "prop-sla-1"
@@ -2656,7 +2656,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="operator")
+        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="host")
 
         assert "updated the live property price" in reply
         assert "inventory fallback" in reply
@@ -2698,7 +2698,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="operator")
+        reply = maybe_handle_message("update 12 Harbour View Road to $400/night", cm, role_name="host")
 
         assert "live property price update failed" in reply
         assert "422 Unprocessable Entity" in reply
@@ -2760,7 +2760,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = maybe_handle_message("update 12 Harbour View Road to $300/night", cm, role_name="operator")
+        reply = maybe_handle_message("update 12 Harbour View Road to $300/night", cm, role_name="host")
 
         assert "updated the live property price" in reply
         assert seen["property_id"] == "prop-sla-1"
@@ -3026,7 +3026,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_role_can_use_live_listing_view(self, tmp_path, monkeypatch):
+    def test_minpaku_host_role_can_use_live_listing_view(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3044,7 +3044,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("show all listings", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("show all listings", cm, role_name="host")
 
         assert "Here are all live listings (1 total):" in reply
         assert "`list-1`" in reply
@@ -3053,7 +3053,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_can_publish_latest_approved_listing(self, tmp_path, monkeypatch):
+    def test_minpaku_host_can_publish_latest_approved_listing(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3101,7 +3101,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("publish listing draft for Unit B", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("publish listing draft for Unit B", cm, role_name="host")
 
         assert "Published `listing` live in Minpaku." not in reply
         assert "Published `Unit B` live in Minpaku." in reply
@@ -3113,7 +3113,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_can_publish_named_approved_listing(self, tmp_path, monkeypatch):
+    def test_minpaku_host_can_publish_named_approved_listing(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3187,7 +3187,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("publish listing draft for Unit A", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("publish listing draft for Unit A", cm, role_name="host")
 
         assert reply is not None
         assert "Published `Unit A` live in Minpaku." in reply
@@ -3199,7 +3199,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_listing_target_returns_none_when_ambiguous(self, tmp_path, monkeypatch):
+    def test_minpaku_host_listing_target_returns_none_when_ambiguous(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3245,7 +3245,7 @@ class TestDecisionPackExtension:
 
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("publish listing for Harbour View", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("publish listing for Harbour View", cm, role_name="host")
 
         assert reply is None
         assert cm.get_staging_entry(first)["status"] == "approved"
@@ -3255,7 +3255,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_can_unlist_latest_approved_listing(self, tmp_path, monkeypatch):
+    def test_minpaku_host_can_unlist_latest_approved_listing(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3313,7 +3313,7 @@ class TestDecisionPackExtension:
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("unlist the latest listing draft", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("unlist the latest listing draft", cm, role_name="host")
 
         assert "Unlisted `Unit B` from Minpaku." in reply
         assert "list-unit-b" in reply
@@ -3323,7 +3323,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_booking_confirmation_requires_payment_verification(self, tmp_path, monkeypatch):
+    def test_minpaku_host_booking_confirmation_requires_payment_verification(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3335,7 +3335,7 @@ class TestDecisionPackExtension:
         ext_module = load_active_extensions(cm)[0]["module"]
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("confirm booking for prop-1 after payment verified", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("confirm booking for prop-1 after payment verified", cm, role_name="host")
 
         assert "Booking confirmation is a Minpaku operator approval" in reply
         assert "ready for operator confirmation" in reply
@@ -3345,7 +3345,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_booking_confirmation_confirms_specific_booking_id(self, tmp_path, monkeypatch):
+    def test_minpaku_host_booking_confirmation_confirms_specific_booking_id(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3369,7 +3369,7 @@ class TestDecisionPackExtension:
 
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
 
-        reply = ext_module.maybe_handle_message("confirm booking bk-123456 after payment verified", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("confirm booking bk-123456 after payment verified", cm, role_name="host")
 
         assert "Confirmed booking `bk-123456` after payment verification." in reply
         assert "`CONFIRMED`" in reply
@@ -3380,7 +3380,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_lists_bookings_needing_payment_confirmation(self, tmp_path, monkeypatch):
+    def test_minpaku_host_lists_bookings_needing_payment_confirmation(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3419,7 +3419,7 @@ class TestDecisionPackExtension:
 
         monkeypatch.setattr(ext_module, "MinpakuClient", FakeClient)
 
-        reply = ext_module.maybe_handle_message("show bookings needing payment confirmation", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("show bookings needing payment confirmation", cm, role_name="host")
 
         assert "Bookings needing operator confirmation (1 total):" in reply
         assert "`bk-need-confirm`" in reply
@@ -3430,7 +3430,7 @@ class TestDecisionPackExtension:
             if module_name == "_sc_extension_minpaku.tools" or module_name.startswith("_sc_extension_minpaku."):
                 del sys.modules[module_name]
 
-    def test_minpaku_operator_booking_confirmation_warns_when_payment_not_verified(self, tmp_path, monkeypatch):
+    def test_minpaku_host_booking_confirmation_warns_when_payment_not_verified(self, tmp_path, monkeypatch):
         from simply_connect import admin_cli
         from simply_connect.context_manager import ContextManager
         from simply_connect.ext_loader import load_active_extensions
@@ -3442,7 +3442,7 @@ class TestDecisionPackExtension:
         ext_module = load_active_extensions(cm)[0]["module"]
         monkeypatch.setenv("MINPAKU_API_URL", "http://example.test")
 
-        reply = ext_module.maybe_handle_message("confirm booking for prop-1", cm, role_name="operator")
+        reply = ext_module.maybe_handle_message("confirm booking for prop-1", cm, role_name="host")
 
         assert "Booking confirmation is a Minpaku operator approval." in reply
         assert "only after payment is verified" in reply

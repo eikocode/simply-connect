@@ -122,6 +122,19 @@ sc-admin --data-dir ../deployments/decision-pack init decision-pack
 `sc-admin init` copies the domain template into your project root. Existing files are not overwritten (use `--force` to override).
 For domains with extensions such as `decision-pack`, the initialized project also carries the local extension package that the SDK runtime imports during tool use.
 
+If you are using this workspace layout, there is also a helper script that wraps the same flow:
+
+```bash
+cd /Users/andrew/backup/work/simply-connect-workspace/deployments
+./bootstrap_new_deployment.sh minpaku /path/to/deployments/minpaku
+```
+
+The helper:
+- creates the target directory
+- runs `sc-admin init <domain>`
+- adds a minimal `.env.example`
+- prints the recommended next steps
+
 For a full local `decision-pack` walkthrough using the host extension tools:
 
 ```bash
@@ -150,7 +163,8 @@ A domain can declare multiple roles in `profile.json`, each with its own context
 {
   "extensions": ["minpaku"],
   "roles": {
-    "host":        {"agent_md": "roles/host/AGENT.md",        "context_filter": ["properties","operations","pricing","contacts"], "telegram_bot_env": "MINPAKU_HOST_BOT_TOKEN"},
+    "operator":    {"agent_md": "roles/operator/AGENT.md",    "context_filter": ["properties","operations","pricing","contacts"], "telegram_bot_env": "MINPAKU_OPERATOR_BOT_TOKEN"},
+    "host":        {"agent_md": "roles/operator/AGENT.md",    "context_filter": ["properties","operations","pricing","contacts"], "telegram_bot_env": "MINPAKU_HOST_BOT_TOKEN"},
     "guest":       {"agent_md": "roles/guest/AGENT.md",       "context_filter": ["properties"],                                   "telegram_bot_env": "MINPAKU_GUEST_BOT_TOKEN"},
     "housekeeping":{"agent_md": "roles/housekeeping/AGENT.md","context_filter": ["properties","operations"],                      "telegram_bot_env": "MINPAKU_HOUSEKEEPING_BOT_TOKEN"}
   }
@@ -160,12 +174,12 @@ A domain can declare multiple roles in `profile.json`, each with its own context
 Run a role-specific relay:
 
 ```bash
-sc-relay --role host
+sc-relay --role operator
 sc-relay --role guest
 sc --role housekeeping
 ```
 
-Sessions are namespaced by role (`host:42`, `guest:99`) so each role has independent conversation history.
+Sessions are namespaced by role (`operator:42`, `guest:99`) so each role has independent conversation history.
 
 ---
 
@@ -190,9 +204,41 @@ When active, the SDK runtime runs a tool-use loop so the agent can call live-dat
 
 The `decision-pack` domain uses this mechanism to expose its extracted shared-submission services through a local extension package in initialized projects.
 
+### Routing Model
+
+Inside a domain deployment, `sc` handles messages in two steps:
+
+1. **Deterministic domain handling first**
+   - Active extensions can expose `maybe_handle_message(...)`.
+   - Use this for stable, high-confidence commands such as:
+     - `mark Unit A available in Minpaku`
+     - `show outstanding debit notes for Unit A`
+     - `confirm booking bk-123 after payment verified`
+   - Deterministic handlers should stay code-driven:
+     - regex / string matching
+     - direct context reads
+     - direct API calls
+     - deterministic parsing of prior session turns
+   - They should not call a model internally.
+
+2. **Domain-aware model fallback second**
+   - If no deterministic handler claims the message, `sc` falls back to the deployment's normal role-aware assistant path.
+   - That path may use the configured runtime/model, but it remains scoped to the active domain, role, tools, and context.
+
+There is usually no separate generic third fallback. Inside a domain deployment, the fallback should still be domain-aware rather than becoming a cross-domain general assistant.
+
+The contract is simple:
+- deterministic handler returns a reply string -> use it and stop
+- deterministic handler returns `None` -> continue to the domain-aware model path
+
 ### Minpaku extension
 
 Tools: `list_properties`, `search_properties`, `get_bookings_by_property`
+
+Recommended Minpaku split:
+- `sc-admin` owns framework mechanics such as ingest and framework review.
+- `sc --role operator` owns Minpaku business actions such as publish, update, unlist, and booking confirmation after payment verification.
+- `sc-admin publish-minpaku`, `update-minpaku`, and `unlist-minpaku` remain available as compatibility helpers, but `sc --role operator` is the preferred path.
 
 Required env vars:
 ```
@@ -264,7 +310,7 @@ your-workspace/
 ```bash
 sc
 # or with a role:
-sc --role host
+sc --role operator
 ```
 
 ```
@@ -387,12 +433,12 @@ sc-mcp --http --port 3005
 Each role can have its own bot token, set via the env var declared in `profile.json`:
 
 ```
-MINPAKU_HOST_BOT_TOKEN=...
+MINPAKU_OPERATOR_BOT_TOKEN=...
 MINPAKU_GUEST_BOT_TOKEN=...
 ```
 
 ```bash
-sc-relay --role host     # uses MINPAKU_HOST_BOT_TOKEN
+sc-relay --role operator # uses MINPAKU_OPERATOR_BOT_TOKEN
 sc-relay --role guest    # uses MINPAKU_GUEST_BOT_TOKEN
 ```
 
@@ -487,10 +533,10 @@ simply-connect/                     Engine repo
 simply-connect-domains/             Domains library repo (separate)
 └── domains/
     ├── minpaku/                    Short-term rental domain
-    │   ├── profile.json            (extensions: ["minpaku"], roles: host/guest/housekeeping/maintenance/finance)
+    │   ├── profile.json            (extensions: ["minpaku"], roles: operator/guest/housekeeping/maintenance/finance)
     │   ├── AGENT.md
     │   ├── context/                (properties, operations, pricing, contacts)
-    │   ├── roles/                  (host, guest, housekeeping, maintenance, finance)
+    │   ├── roles/                  (operator, guest, housekeeping, maintenance, finance)
     │   ├── admin/intake_map.md
     │   └── extension/              Minpaku API integration
     │       ├── tools.py            list_properties, search_properties, get_bookings_by_property

@@ -17,7 +17,7 @@ class TestSDKRuntimeDecisionPack:
 
         monkeypatch.chdir(target_root)
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set, session_type="framework"):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_create_submission" in tool_names
             assert "decision_pack_get_latest_submission" in tool_names
@@ -79,7 +79,7 @@ class TestSDKRuntimeDecisionPack:
 
         call_counter = {"count": 0}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set, session_type="framework"):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_get_working_state" in tool_names
             assert role == "founder"
@@ -168,7 +168,7 @@ class TestSDKRuntimeDecisionPack:
         monkeypatch.chdir(target_root)
         call_counter = {"count": 0}
 
-        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set):
+        def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, categories, working_set, session_type="framework"):
             tool_names = {tool["name"] for tool in tools}
             assert "decision_pack_create_and_assess_submission" in tool_names
             assert "decision_pack_process_pricing_change" in tool_names

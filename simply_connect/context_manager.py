@@ -223,6 +223,22 @@ class ContextManager:
         return self._profile.get("roles", {})
 
     @property
+    def domain_roles(self) -> dict:
+        """Domain role definitions from profile.json.
+
+        Each domain role can define:
+        - trust_weight: float 0.0-1.0 (default 0.5)
+        - auto_promote: bool (default False)
+        - promotion_criteria: dict override for this role
+        """
+        return self._profile.get("domain_roles", {})
+
+    @property
+    def promotion_criteria(self) -> dict:
+        """Global promotion criteria from profile.json."""
+        return self._profile.get("promotion_criteria", {})
+
+    @property
     def starter_prompts(self) -> dict[str, list[str]]:
         """Role-keyed starter prompts from profile.json."""
         return self._profile.get("starter_prompts", _DEFAULT_STARTER_PROMPTS)
@@ -401,11 +417,13 @@ class ContextManager:
             "id": entry_id,
             "captured": now.isoformat(),
             "source": source,
+            "source_role": source.split(":")[0] if ":" in source else "operator",
             "status": "unconfirmed",
             "category": category,
             "summary": summary,
             "reviewed_by": "pending",
             "reviewed_at": None,
+            "curated": source.startswith("curator:"),
         }
 
         file_content = _render_frontmatter(meta, content.strip())

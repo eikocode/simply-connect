@@ -6,7 +6,7 @@ DEPLOYMENTS = {
         "root": Path("/Users/andrew/backup/work/simply-connect-workspace/deployments/minpaku"),
         "role": "operator",
         "header": "Starter prompts for operator",
-        "expected_text": "Publish the latest approved Minpaku listing draft.",
+        "expected_text": "Publish the latest listing draft.",
     },
     "super_landlord": {
         "root": Path("/Users/andrew/backup/work/simply-connect-workspace/deployments/super-landlord"),
@@ -16,15 +16,15 @@ DEPLOYMENTS = {
     },
     "legal_contracts": {
         "root": Path("/Users/andrew/backup/work/simply-connect-workspace/deployments/legal-contracts"),
-        "role": "reviewer",
-        "header": "Starter prompts for reviewer",
-        "expected_text": "top legal risks first",
+        "role": "operator",
+        "header": "Starter prompts for operator",
+        "expected_text": "Review Contract-PDF-Samples/contract1_hardware_supplier_agreement.md",
     },
     "decision_pack": {
         "root": Path("/Users/andrew/backup/work/simply-connect-workspace/deployments/decision-pack"),
-        "role": "reviewer",
-        "header": "Starter prompts for reviewer",
-        "expected_text": "Hold the active material change for policy review.",
+        "role": "operator",
+        "header": "Starter prompts for operator",
+        "expected_text": "Show the operator overview for the governed state.",
     },
 }
 

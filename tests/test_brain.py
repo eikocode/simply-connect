@@ -314,3 +314,87 @@ class TestReviewStagingEntry:
         # Should return a safe default — defer, not crash
         assert result["recommendation"] == "defer"
         assert isinstance(result["reason"], str)
+
+
+class TestConflictDetectionHeuristic:
+    def test_detects_session_content_with_negation(self, project_root, mock_context):
+        """When reply uses session content with negation words, flags used_session."""
+        history = [
+            {"role": "user", "content": "Remember that payment terms are net 30."},
+            {"role": "capture", "content": json.dumps({
+                "summary": "Net 30 terms",
+                "content": "Payment terms are net 30 days.",
+                "category": "business",
+            })},
+            {"role": "assistant", "content": "Noted."},
+        ]
+
+        response_json = json.dumps({
+            "reply": "Actually, payment terms are not net 30 — they changed to net 60.",
+            "capture": None,
+            "confidence": 0.9,
+            "used_unconfirmed": False,
+            "used_session": False,
+            "raw_response": "test",
+        })
+        mock_client = _make_mock_claude(response_json)
+
+        with patch("simply_connect.brain._get_claude", return_value=mock_client), \
+             patch("simply_connect.brain._resolve_project_root", return_value=project_root):
+            from simply_connect.brain import respond
+            result = respond("What are our payment terms?", mock_context, history=history)
+
+        assert result["used_session"] is True
+
+    def test_no_false_positive_without_negation(self, project_root, mock_context):
+        """Reply using session content without negation doesn't trigger flag."""
+        history = [
+            {"role": "user", "content": "Remember payment terms are net 30."},
+            {"role": "capture", "content": json.dumps({
+                "summary": "Net 30 terms",
+                "content": "Payment terms are net 30 days.",
+                "category": "business",
+            })},
+        ]
+
+        response_json = json.dumps({
+            "reply": "Payment terms are net 30 days as noted.",
+            "capture": None,
+            "confidence": 0.9,
+            "used_unconfirmed": False,
+            "used_session": False,
+            "raw_response": "test",
+        })
+        mock_client = _make_mock_claude(response_json)
+
+        with patch("simply_connect.brain._get_claude", return_value=mock_client), \
+             patch("simply_connect.brain._resolve_project_root", return_value=project_root):
+            from simply_connect.brain import respond
+            result = respond("What are our payment terms?", mock_context, history=history)
+
+        # No negation words, so used_session stays False
+        assert result["used_session"] is False
+
+    def test_no_capture_turns_no_detection(self, project_root, mock_context):
+        """No capture turns in history means no conflict detection."""
+        history = [
+            {"role": "user", "content": "What are the payment terms?"},
+            {"role": "assistant", "content": "Net 60 days."},
+        ]
+
+        response_json = json.dumps({
+            "reply": "Payment terms are not what they used to be.",
+            "capture": None,
+            "confidence": 0.9,
+            "used_unconfirmed": False,
+            "used_session": False,
+            "raw_response": "test",
+        })
+        mock_client = _make_mock_claude(response_json)
+
+        with patch("simply_connect.brain._get_claude", return_value=mock_client), \
+             patch("simply_connect.brain._resolve_project_root", return_value=project_root):
+            from simply_connect.brain import respond
+            result = respond("What are our payment terms?", mock_context, history=history)
+
+        assert result["used_session"] is False

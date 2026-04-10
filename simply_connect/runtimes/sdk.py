@@ -6,6 +6,10 @@ Conversation history and staging captures are managed per user_id.
 Routing:
   - Profile has no active extensions → brain.respond() (single-shot, JSON, backward compatible)
   - Profile has active extensions    → brain.respond_with_tools() (tool_use loop)
+
+Session type:
+  - Framework roles (operator, admin) → writes to staging
+  - Domain roles (anything else)      → writes to session memory
 """
 
 import logging
@@ -14,6 +18,9 @@ from pathlib import Path
 from .base import ClaudeRuntime
 
 log = logging.getLogger(__name__)
+
+# Roles that are considered framework-level and write directly to staging
+_FRAMEWORK_ROLES = {"operator", "admin"}
 
 
 class SDKRuntime(ClaudeRuntime):
@@ -31,6 +38,7 @@ class SDKRuntime(ClaudeRuntime):
         self._cm = ContextManager()
         self._sm = SessionManager()
         self._role_name = role_name
+        self._session_type = "framework" if role_name in _FRAMEWORK_ROLES else "domain"
 
     def call(self, user_message: str, user_id: int) -> str:
         """Process a message and return Claude's reply."""
@@ -66,11 +74,32 @@ class SDKRuntime(ClaudeRuntime):
 
             ext_tools = get_all_tools(self._cm)
 
-            # dispatch_fn handles both extension tools and capture_to_staging
+            # dispatch_fn handles both extension tools and capture tools
             def dispatch_fn(name: str, args: dict) -> str:
                 import json as _json
                 guarded_args = dict(args)
                 guarded_args["__session_role"] = role_prefix
+
+                # Domain roles use capture_to_session (ephemeral)
+                if name == "capture_to_session":
+                    try:
+                        self._sm.add_turn(
+                            session_id,
+                            "capture",
+                            _json.dumps({
+                                "summary": guarded_args.get("summary", ""),
+                                "content": guarded_args.get("content", ""),
+                                "category": guarded_args.get("category", "general"),
+                            }),
+                        )
+                        return _json.dumps({
+                            "status": "noted",
+                            "message": "Noted — under review.",
+                        })
+                    except Exception as e:
+                        return _json.dumps({"error": str(e)})
+
+                # Framework roles use capture_to_staging
                 if name == "capture_to_staging":
                     try:
                         entry_id = self._cm.create_staging_entry(
@@ -86,6 +115,7 @@ class SDKRuntime(ClaudeRuntime):
                         })
                     except Exception as e:
                         return _json.dumps({"error": str(e)})
+
                 return dispatch_extension_tool(name, guarded_args, self._cm)
 
             result = respond_with_tools(
@@ -98,6 +128,7 @@ class SDKRuntime(ClaudeRuntime):
                 role=role_prefix,
                 agent_md_path=agent_md_path,
                 categories=list(self._cm.CATEGORY_MAP.keys()),
+                session_type=self._session_type,
             )
 
         else:
@@ -112,21 +143,36 @@ class SDKRuntime(ClaudeRuntime):
                 role=role_prefix,
                 agent_md_path=agent_md_path,
                 categories=list(self._cm.CATEGORY_MAP.keys()),
+                session_type=self._session_type,
             )
 
-            # Write staging entry if capture was detected
+            # Handle capture — domain roles go to session, framework to staging
             capture = result.get("capture")
             if capture:
-                try:
-                    entry_id = self._cm.create_staging_entry(
-                        summary=capture.get("summary", ""),
-                        content=capture.get("content", ""),
-                        category=capture.get("category", "general"),
-                        source=f"telegram:{user_id}",
+                if self._session_type == "domain":
+                    # Store capture in session memory for later curation
+                    import json as _json
+                    self._sm.add_turn(
+                        session_id,
+                        "capture",
+                        _json.dumps({
+                            "summary": capture.get("summary", ""),
+                            "content": capture.get("content", ""),
+                            "category": capture.get("category", "general"),
+                        }),
                     )
-                    log.info(f"Staging entry created: {entry_id}")
-                except Exception:
-                    log.exception("Failed to create staging entry")
+                else:
+                    # Framework role — write to staging
+                    try:
+                        entry_id = self._cm.create_staging_entry(
+                            summary=capture.get("summary", ""),
+                            content=capture.get("content", ""),
+                            category=capture.get("category", "general"),
+                            source=f"telegram:{user_id}",
+                        )
+                        log.info(f"Staging entry created: {entry_id}")
+                    except Exception:
+                        log.exception("Failed to create staging entry")
 
         reply = result.get("reply", "")
 

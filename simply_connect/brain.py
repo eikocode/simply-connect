@@ -129,7 +129,7 @@ Requirements:
 - Output only JSON.
 - Preserve the original meaning.
 - Use this exact top-level schema:
-  {{"reply": string, "capture": object|null, "confidence": number, "used_unconfirmed": boolean, "raw_response": string}}
+  {{"reply": string, "capture": object|null, "confidence": number, "used_unconfirmed": boolean, "used_session": boolean, "raw_response": string}}
 - Escape all newlines and quotes correctly.
 - If capture is present, it must have:
   {{"summary": string, "content": string, "category": string}}
@@ -205,6 +205,7 @@ def respond(
     agent_md_path: Path | None = None,
     categories: list[str] | None = None,
     working_set: dict[str, Any] | None = None,
+    session_type: str = "framework",
 ) -> dict[str, Any]:
     """
     Generate a trust-aware response to an operator or admin message.
@@ -215,11 +216,14 @@ def respond(
                   Keys: "committed" (dict), "staging" (list).
         history:  Conversation history list of {"role": ..., "content": ...}.
         role:     "operator" or "admin".
+        session_type: "framework" (sc CLI, writes to staging) or
+                      "domain" (domain role, writes to session).
 
     Returns:
         {
             "reply": str,
             "capture": None | {"summary": str, "content": str, "category": str},
+            "capture_to_session": bool,  # True when session_type is "domain"
             "confidence": float,
             "used_unconfirmed": bool,
             "raw_response": str,
@@ -235,6 +239,13 @@ def respond(
 
     _default_categories = ["business", "parties", "preferences", "contracts", "general"]
     category_hint = " | ".join(categories) if categories else " | ".join(_default_categories)
+
+    capture_instruction = (
+        'Append to the reply: "\\n\\nNoted — under review."'
+        if session_type == "domain"
+        else 'And append to the reply: "\\n\\nStaged — run sc-admin review to commit."'
+    )
+    capture_target = "session (noted for review)" if session_type == "domain" else "staging"
 
     system_prompt = f"""{agent_instructions}
 
@@ -268,8 +279,18 @@ You MUST respond with ONLY a valid JSON object in this exact format — no other
   "capture": null,
   "confidence": 0.95,
   "used_unconfirmed": false,
+  "used_session": false,
   "raw_response": "brief internal note about your reasoning"
 }}
+
+## Trust Hierarchy
+When reasoning across context layers, follow this strict ordering:
+1. **Committed context** — ground truth, full trust
+2. **Staging context** — usable but flagged as unconfirmed
+3. **Session memory** — ephemeral, lowest trust
+
+When layers conflict, committed context always wins. If session content contradicts committed context,
+flag the discrepancy in your reply and defer to committed context.
 
 ## Capture Detection
 Populate the capture field when the operator's message signals intent to persist something.
@@ -280,17 +301,17 @@ This includes:
 
 **Explicit record/issue phrases for a prior draft:** if the operator says "record the debit note as issued",
 "stage only the context update", "record this as issued", or similar phrasing that clearly means
-the latest draft should be persisted as a staged business record, capture that latest draft to staging
+the latest draft should be persisted as a staged business record, capture that latest draft to {capture_target}
 using the matching category (for a debit note draft, use "debit_notes").
 
 **Explicit property-from-bill phrases:** if the operator asks to extract, add, capture, or stage
 the property from the latest utility bill, use the latest utility-bill content in recent history or
-staging to derive a property candidate and capture it as a "properties" staging entry.
+staging to derive a property candidate and capture it as a "properties" {capture_target.split()[0]} entry.
 
 **Implicit confirmation of a prior draft:** if the operator says "confirm", "yes", "ok",
 "issue it", "send it", or similar short affirmatives AND the previous assistant turn contained
-a draft document (debit note, invoice, contract, etc.) — capture that document to staging.
-Use the category that matches the document type (e.g. "debit_notes" for a debit note draft).
+a draft document (debit note, invoice, contract, etc.) — capture that document to {capture_target}
+using the category that matches the document type (e.g. "debit_notes" for a debit note draft).
 
 {{
   "capture": {{
@@ -300,7 +321,7 @@ Use the category that matches the document type (e.g. "debit_notes" for a debit 
   }}
 }}
 
-And append to the reply: "\\n\\nStaged — run sc-admin review to commit."
+{capture_instruction}
 
 **Never claim to write directly to context files.** All updates go through staging.
 
@@ -308,6 +329,10 @@ And append to the reply: "\\n\\nStaged — run sc-admin review to commit."
 Set "used_unconfirmed": true if any staging entry above influenced your response.
 When used_unconfirmed is true, append to your reply:
 "\\n\\n*(note: drawing on unconfirmed context — pending admin review)*"
+
+## Session Memory
+Set "used_session": true if you drew on session memory (ephemeral conversation history) to answer.
+Session memory is the lowest trust layer — flag when it influenced your response.
 
 ## General Rules
 - Never refuse due to missing context. Work with what is available.
@@ -335,8 +360,10 @@ When used_unconfirmed is true, append to your reply:
     defaults: dict[str, Any] = {
         "reply": "",
         "capture": None,
+        "capture_to_session": session_type == "domain",
         "confidence": 0.5,
         "used_unconfirmed": False,
+        "used_session": False,
         "raw_response": "",
     }
 
@@ -380,6 +407,33 @@ When used_unconfirmed is true, append to your reply:
                 if summary_words & reply_words:
                     result["used_unconfirmed"] = True
                     break
+
+        # Heuristic conflict detection: if reply uses session content that
+        # contradicts committed context, flag it.
+        # This is a safety net for when the model draws on ephemeral session
+        # memory that conflicts with authoritative committed context.
+        if history and not result.get("used_session"):
+            session_turns = [t for t in history if t.get("role") == "capture"]
+            if session_turns:
+                committed_text = " ".join(context.get("committed", {}).values()).lower()
+                for turn in session_turns:
+                    try:
+                        cap = json.loads(turn.get("content", "{}"))
+                        cap_content = cap.get("content", "").lower()
+                        # Simple contradiction heuristic: if session content
+                        # contains negation words near committed content terms
+                        reply_lower = result.get("reply", "").lower()
+                        cap_words = set(cap_content.split())
+                        reply_words = set(reply_lower.split())
+                        # If reply uses session content AND committed has
+                        # different values for the same topic, flag it
+                        if cap_words & reply_words and committed_text:
+                            # Check for negation patterns
+                            negation_words = {"not", "no", "never", "instead", "changed", "updated", "different"}
+                            if negation_words & reply_words:
+                                result["used_session"] = True
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
         log.info(
             f"Brain respond: confidence={result['confidence']} "
@@ -436,6 +490,40 @@ def _make_capture_tool(categories: list[str] | None = None) -> dict:
     }
 
 
+def _make_capture_session_tool(categories: list[str] | None = None) -> dict:
+    _default_categories = ["business", "parties", "preferences", "contracts", "general"]
+    hint = " | ".join(categories) if categories else " | ".join(_default_categories)
+    return {
+        "name": "capture_to_session",
+        "description": (
+            "Record a note in the current session for later review. "
+            "This does NOT create a staging entry — it is ephemeral session memory. "
+            "Use when a domain role asks to remember, note, or save something. "
+            "A curator agent will later evaluate session content for promotion to staging."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "One-line summary of what is being captured (max 80 chars).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The full content to store in session memory.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        f"Context category matching the active profile ({hint})"
+                    ),
+                },
+            },
+            "required": ["summary", "content", "category"],
+        },
+    }
+
+
 def respond_with_tools(
     message: str,
     context: dict[str, Any],
@@ -446,6 +534,7 @@ def respond_with_tools(
     agent_md_path: Path | None = None,
     categories: list[str] | None = None,
     working_set: dict[str, Any] | None = None,
+    session_type: str = "framework",
 ) -> dict[str, Any]:
     """
     Generate a response using the tool_use loop — for profiles with active extensions.
@@ -492,6 +581,9 @@ def respond_with_tools(
     staging_block = _format_staging(staging_entries)
     working_set_block = _format_working_set(working_set)
 
+    capture_tool_name = "capture_to_session" if session_type == "domain" else "capture_to_staging"
+    capture_ack = "Noted — under review." if session_type == "domain" else "Captured — pending admin review."
+
     system_prompt = f"""{agent_instructions}
 
 ---
@@ -520,17 +612,26 @@ Current session role: {role}
 Respond naturally in plain text. You have access to tools — use them when the operator's
 question requires live data or computation. Present tool results clearly in your reply.
 
+## Trust Hierarchy
+When reasoning across context layers, follow this strict ordering:
+1. **Committed context** — ground truth, full trust
+2. **Staging context** — usable but flagged as unconfirmed
+3. **Session memory** — ephemeral, lowest trust
+
+When layers conflict, committed context always wins. If session content contradicts committed context,
+flag the discrepancy in your reply and defer to committed context.
+
 When the operator signals capture intent ("remember this", "note that", "learn this",
 "keep this in mind", "going forward", "for future reference", "add this to context",
-"don't forget that") — call the capture_to_staging tool with summary, content, and category.
-Append to your reply: "Captured — pending admin review."
+"don't forget that") — call the {capture_tool_name} tool with summary, content, and category.
+Append to your reply: "{capture_ack}"
 
 If the operator explicitly asks to record or stage the latest debit note / invoice / draft as issued
 for framework approval, treat that as capture intent tied to the latest assistant draft and call
-capture_to_staging with the matching business category (for debit notes, use "debit_notes").
+{capture_tool_name} with the matching business category (for debit notes, use "debit_notes").
 If the operator explicitly asks to extract, add, capture, or stage the property from the latest
 utility bill, treat that as capture intent tied to the latest utility-bill context and call
-capture_to_staging with category "properties".
+{capture_tool_name} with category "properties".
 
 When you draw on staging (unconfirmed) context in your reply, append:
 "*(note: drawing on unconfirmed context — pending admin review)*"
@@ -554,8 +655,11 @@ incomplete, or unmatched, ask for clarification instead of asserting a result fr
                 messages.append({"role": role_val, "content": content_val})
     messages.append({"role": "user", "content": message})
 
-    # Merge capture_to_staging into the tools list
-    all_tools = [_make_capture_tool(categories)] + list(tools)
+    # Merge capture tool into the tools list based on session type
+    if session_type == "domain":
+        all_tools = [_make_capture_session_tool(categories)] + list(tools)
+    else:
+        all_tools = [_make_capture_tool(categories)] + list(tools)
 
     reply_text = ""
 
@@ -626,6 +730,7 @@ incomplete, or unmatched, ask for clarification instead of asserting a result fr
         "capture": None,
         "confidence": 1.0,
         "used_unconfirmed": False,
+        "used_session": False,
         "raw_response": "",
     }
 

@@ -1002,6 +1002,96 @@ class {class_name}Client:
 
 
 # ---------------------------------------------------------------------------
+# Curate subcommand
+# ---------------------------------------------------------------------------
+
+def cmd_curate(cm, session: str | None = None, curate_all: bool = False, dry_run: bool = False) -> None:
+    from simply_connect.curator import curate_session, curate_all_sessions
+    from simply_connect.session_manager import SessionManager
+
+    sm = SessionManager(data_dir=cm._root / "data" / "sessions")
+
+    if session:
+        results = [curate_session(cm, sm, session, dry_run=dry_run)]
+    elif curate_all:
+        results = curate_all_sessions(cm, sm, dry_run=dry_run)
+    else:
+        # Default: curate most recent session with captures
+        sessions = sm.list_sessions()
+        if not sessions:
+            print("\n  No sessions found.")
+            return
+        # Find first session with captures
+        for s in sessions:
+            sid = s.get("session_id", "")
+            if not sid:
+                continue
+            session_data = sm.load(sid)
+            history = session_data.get("history", [])
+            if any(turn.get("role") == "capture" for turn in history):
+                results = [curate_session(cm, sm, sid, dry_run=dry_run)]
+                break
+        else:
+            print("\n  No sessions with captures found. Use --all to curate all sessions.")
+            return
+
+    print()
+    mode = "DRY RUN — no staging entries created" if dry_run else "LIVE"
+    print(f"  Curator ({mode})")
+    print(DIVIDER)
+
+    total_promoted = 0
+    total_deferred = 0
+    total_rejected = 0
+    total_evaluated = 0
+
+    for result in results:
+        sid = result.get("session_id", "unknown")
+        evaluated = result.get("captures_evaluated", 0)
+        promoted = result.get("promoted", 0)
+        deferred = result.get("deferred", 0)
+        rejected = result.get("rejected", 0)
+        entry_ids = result.get("entry_ids", [])
+        error = result.get("error")
+        note = result.get("note")
+
+        if error:
+            print(f"\n  Session {sid}: {error}")
+            continue
+        if note and evaluated == 0:
+            print(f"\n  Session {sid}: {note}")
+            continue
+
+        total_evaluated += evaluated
+        total_promoted += promoted
+        total_deferred += deferred
+        total_rejected += rejected
+
+        print(f"\n  Session: {sid}")
+        print(f"    Captures evaluated: {evaluated}")
+        print(f"    Promoted: {promoted}  ·  Deferred: {deferred}  ·  Rejected: {rejected}")
+
+        if entry_ids:
+            print(f"    Staging entries created:")
+            for eid in entry_ids:
+                print(f"      - {eid}")
+
+        if dry_run:
+            evaluations = result.get("evaluations", [])
+            for ev in evaluations:
+                rec = ev.get("recommendation", "?")
+                reason = ev.get("reason", "")
+                idx = ev.get("capture_index", 0)
+                print(f"    [{rec.upper()}] Capture {idx}: {reason}")
+
+    print()
+    if results:
+        print(f"  Total: {total_evaluated} evaluated, {total_promoted} promoted, "
+              f"{total_deferred} deferred, {total_rejected} rejected")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Status subcommand
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1127,22 @@ def cmd_status(cm) -> None:
     if sessions_dir.exists():
         session_count = len(list(sessions_dir.glob("*.json")))
         print(f"\n  Sessions: {session_count} stored")
+
+    # Domain roles
+    domain_roles = cm.domain_roles
+    if domain_roles:
+        print(f"\n  Domain roles:")
+        for role_name, role_config in domain_roles.items():
+            trust = role_config.get("trust_weight", 0.5)
+            auto = role_config.get("auto_promote", False)
+            print(f"    {role_name}: trust={trust}, auto_promote={auto}")
+
+    # Promotion criteria
+    criteria = cm.promotion_criteria
+    if criteria:
+        print(f"\n  Promotion criteria:")
+        for key, value in criteria.items():
+            print(f"    {key}: {value}")
 
     print()
 
@@ -1151,6 +1257,44 @@ def admin_main() -> None:
     # status
     subparsers.add_parser("status", help="Context health summary")
 
+    # curate
+    curate_parser = subparsers.add_parser(
+        "curate",
+        help="Curate session captures and promote worthy items to staging",
+    )
+    curate_parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="Session ID to curate (default: all sessions)",
+    )
+    curate_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Curate all sessions with captures",
+    )
+    curate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show recommendations without creating staging entries",
+    )
+    curate_parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run curator as background daemon",
+    )
+    curate_parser.add_argument(
+        "--interval",
+        type=int,
+        default=30,
+        help="Daemon interval in minutes (default: 30)",
+    )
+    curate_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run once on schedule (non-daemon) and exit",
+    )
+
     args = parser.parse_args()
 
     from simply_connect.context_manager import ContextManager
@@ -1176,6 +1320,30 @@ def admin_main() -> None:
         cmd_new_domain(_resolve_domains_dir())
     elif args.command == "status":
         cmd_status(cm)
+    elif args.command == "curate":
+        from simply_connect.curator import schedule_curator
+
+        result = schedule_curator(
+            cm,
+            interval_minutes=args.interval,
+            dry_run=args.dry_run,
+            run_once=not args.daemon,
+        )
+        if result["mode"] == "daemon":
+            print(f"\n  Curator daemon started (interval: {args.interval} min)")
+            print("  Press Ctrl+C to stop")
+            import time
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n  Stopping daemon...")
+        else:
+            results = result.get("results", [])
+            total_promoted = sum(r.get("promoted", 0) for r in results)
+            total_deferred = sum(r.get("deferred", 0) for r in results)
+            total_rejected = sum(r.get("rejected", 0) for r in results)
+            print(f"\n  Curated {len(results)} session(s): {total_promoted} promoted, {total_deferred} deferred, {total_rejected} rejected")
     else:
         parser.print_help()
         sys.exit(1)

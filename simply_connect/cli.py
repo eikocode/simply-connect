@@ -119,9 +119,13 @@ def main() -> None:
 
     # Resolve role
     role_name = args.role or "operator"
+    
+    # If domain roles are configured, default to the first available role instead of "operator"
+    if not args.role and cm.roles:
+        role_name = next(iter(cm.roles))
+    
     if args.role and args.role not in cm.roles:
-        print(f"  Warning: role '{args.role}' not found in profile.json — using 'operator'")
-        role_name = "operator"
+        print(f"  Warning: role '{args.role}' not found in profile.json — using '{role_name}'")
 
     session_id = args.session or str(uuid.uuid4())[:8]
     # Namespace session by role when roles are configured

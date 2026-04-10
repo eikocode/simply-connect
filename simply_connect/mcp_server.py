@@ -33,6 +33,10 @@ _cm = ContextManager()
 _session_role = os.environ.get("SC_SESSION_ROLE", "operator")
 _capture_roles = set(_cm._profile.get("capture_roles", []))
 
+# Roles that are considered framework-level and write directly to staging
+_FRAMEWORK_ROLES = {"operator", "admin"}
+_is_domain_role = _session_role not in _FRAMEWORK_ROLES
+
 # ---------------------------------------------------------------------------
 # Extension tool discovery (at module load time)
 # ---------------------------------------------------------------------------
@@ -104,6 +108,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     if name == "capture_to_staging":
+        # Domain roles cannot write to staging
+        if _is_domain_role:
+            raise ValueError(
+                f"Domain role '{_session_role}' cannot write to staging. "
+                f"Use capture_to_session instead."
+            )
         if _capture_roles and _session_role not in _capture_roles:
             raise ValueError(f"Role '{_session_role}' is not allowed to capture to staging")
         summary = arguments.get("summary", "")
@@ -124,6 +134,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             "entry_id": entry_id,
             "status": "pending",
             "message": f"Captured to staging as '{entry_id}'. Pending admin review before committing to context.",
+        }
+        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+    if name == "capture_to_session":
+        # Domain roles write to session — ephemeral, for later curation
+        if not _is_domain_role and _capture_roles and _session_role not in _capture_roles:
+            raise ValueError(f"Role '{_session_role}' is not allowed to capture to session")
+        summary = arguments.get("summary", "")
+        content = arguments.get("content", "")
+        category = arguments.get("category", "general")
+
+        if not summary or not content:
+            raise ValueError("Both 'summary' and 'content' are required for capture_to_session")
+
+        result = {
+            "status": "noted",
+            "message": "Noted — under review.",
+            "summary": summary,
+            "category": category,
         }
         return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 

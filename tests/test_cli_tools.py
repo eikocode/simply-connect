@@ -149,7 +149,7 @@ class TestCliWithExtensions:
 
         def fake_get_runtime(runtime, role_name="operator", project_root=None, agent_md_path=None):
             assert runtime == "cli"
-            assert role_name == "host"
+            assert role_name == "operator"
             assert project_root == target_root
             assert agent_md_path == target_root / "roles" / "operator" / "AGENT.md"
             return FakeRuntime()
@@ -163,7 +163,7 @@ class TestCliWithExtensions:
 
         from simply_connect.cli import main
 
-        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "host"])
+        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "operator"])
         main()
 
         out = capsys.readouterr().out
@@ -194,7 +194,7 @@ class TestCliWithExtensions:
 
         def fake_get_runtime(runtime, role_name="operator", project_root=None, agent_md_path=None):
             assert runtime == "opencode"
-            assert role_name == "host"
+            assert role_name == "operator"
             assert project_root == target_root
             assert agent_md_path == target_root / "roles" / "operator" / "AGENT.md"
             return FakeRuntime()
@@ -208,7 +208,7 @@ class TestCliWithExtensions:
 
         from simply_connect.cli import main
 
-        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "host"])
+        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "operator"])
         main()
 
         out = capsys.readouterr().out
@@ -414,8 +414,8 @@ class TestCliWithExtensions:
         def fake_respond_with_tools(*, message, context, tools, dispatch_fn, history, role, agent_md_path, working_set):
             seen["calls"] += 1
             if seen["calls"] == 1:
-                assert role == "host"
-                assert working_set["role"] == "host"
+                assert role == "operator"
+                assert working_set["role"] == "operator"
                 assert len(context["staging"]) == 1
                 assert context["staging"][0]["id"] == entry_id
                 cm.update_staging_status(entry_id, "approved", "human")
@@ -444,7 +444,7 @@ class TestCliWithExtensions:
 
         from simply_connect.cli import main
 
-        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "host"])
+        monkeypatch.setattr("sys.argv", ["sc", "--data-dir", str(target_root), "--role", "operator"])
         main()
 
         out = capsys.readouterr().out

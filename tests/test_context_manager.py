@@ -225,3 +225,35 @@ class TestStatusSummary:
         summary = cm.status_summary()
         assert summary["staging"]["unconfirmed"] == 1
         assert summary["staging"]["approved"] == 1
+
+
+class TestDomainRoleConfig:
+    def test_domain_roles_empty_by_default(self, cm):
+        assert cm.domain_roles == {}
+
+    def test_promotion_criteria_empty_by_default(self, cm):
+        assert cm.promotion_criteria == {}
+
+    def test_domain_roles_loaded_from_profile(self, tmp_path):
+        from simply_connect.context_manager import ContextManager
+        root = tmp_path / "project"
+        root.mkdir()
+        (root / "AGENT.md").write_text("# Test\n")
+        (root / "profile.json").write_text(json.dumps({
+            "name": "Test",
+            "context_files": ["business"],
+            "category_map": {"business": "business.md", "general": "business.md"},
+            "domain_roles": {
+                "finance": {"trust_weight": 0.8, "auto_promote": True},
+            },
+            "promotion_criteria": {"enduring_knowledge": False},
+        }))
+        (root / "context").mkdir()
+        (root / "staging").mkdir()
+        (root / "context" / "business.md").write_text("Test\n")
+
+        cm = ContextManager(root=root)
+        assert "finance" in cm.domain_roles
+        assert cm.domain_roles["finance"]["trust_weight"] == 0.8
+        assert cm.domain_roles["finance"]["auto_promote"] is True
+        assert cm.promotion_criteria["enduring_knowledge"] is False
