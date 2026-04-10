@@ -199,6 +199,17 @@ class CLIRuntime(ClaudeRuntime):
 
     def call(self, user_message: str, user_id: int) -> str:
         """Send a message to claude subprocess and return the reply."""
+        # Extension message interception (before Claude subprocess)
+        from ..context_manager import ContextManager
+        from ..ext_loader import maybe_handle_message as _ext_maybe
+        cm = ContextManager(root=self._project_root)
+        ext_reply = _ext_maybe(
+            user_message, cm, role_name=self._role_name,
+            history=None, user_id=user_id,
+        )
+        if ext_reply is not None:
+            return ext_reply
+
         mcp_config = _mcp_config_path(self._project_root, self._role_name)
         session_id = _sessions.get(user_id)
         working_set = self._build_working_set_snapshot()

@@ -58,6 +58,18 @@ class SDKRuntime(ClaudeRuntime):
             agent_md_path = None
 
         history = self._sm.get_history(session_id)
+
+        # Extension message interception (before Claude) — mirrors cli.py behavior
+        from ..ext_loader import maybe_handle_message as _ext_maybe
+        ext_reply = _ext_maybe(
+            user_message, self._cm, role_name=self._role_name,
+            history=history, user_id=user_id,
+        )
+        if ext_reply is not None:
+            self._sm.add_turn(session_id, "user", user_message)
+            self._sm.add_turn(session_id, "assistant", ext_reply)
+            return ext_reply
+
         working_set = self._cm.build_working_set_snapshot(role_name=self._role_name)
 
         active_exts = self._cm.active_extensions
