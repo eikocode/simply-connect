@@ -103,6 +103,31 @@ def dispatch_extension_tool(name: str, args: dict, cm) -> str:
     raise ValueError(f"No extension handles tool: {name}")
 
 
+def maybe_handle_document(file_bytes: bytes, filename: str, mime_type: str, caption: str, cm, role_name: str = "operator", **kwargs) -> str | None:
+    """Give active extensions a chance to handle a document upload directly.
+
+    Extensions can optionally expose:
+        maybe_handle_document(file_bytes, filename, mime_type, caption, cm, role_name, **kwargs) -> str | None
+
+    Returns a reply string if the extension handled the document (replaces the default
+    staging behavior), or None to fall through to default ingestion.
+    """
+    for ext in load_active_extensions(cm):
+        handler = getattr(ext["module"], "maybe_handle_document", None)
+        if handler is None:
+            continue
+        try:
+            result = handler(file_bytes, filename, mime_type, caption, cm, role_name=role_name, **kwargs)
+        except TypeError:
+            try:
+                result = handler(file_bytes, filename, mime_type, caption, cm)
+            except TypeError:
+                continue
+        if result:
+            return result
+    return None
+
+
 def maybe_handle_message(message: str, cm, role_name: str = "operator", history: list[dict] | None = None, **kwargs) -> str | None:
     """Give active extensions a chance to deterministically handle a raw user message.
 

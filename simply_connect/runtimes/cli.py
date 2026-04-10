@@ -32,6 +32,7 @@ def _find_project_root() -> Path:
 
 def _mcp_config_path(project_root: Path | None = None, role_name: str = "operator") -> Path:
     """Return path to mcp_config.json, creating it if needed."""
+    import sys
     root = project_root or _find_project_root()
     config_path = root / "mcp_config.json"
     # Always rewrite so role/env changes are reflected across sessions.
@@ -47,10 +48,13 @@ def _mcp_config_path(project_root: Path | None = None, role_name: str = "operato
         value = os.getenv(key)
         if value:
             env[key] = value
+    # Use the current Python interpreter (sys.executable) instead of "python"
+    # since system may only have python3 or python3.12.
     mcp_config = {
         "mcpServers": {
             "simply-connect": {
-                "command": "python",
+                "type": "stdio",
+                "command": sys.executable,
                 "args": ["-m", "simply_connect.mcp_server"],
                 "cwd": str(root),
                 "env": env,
@@ -203,9 +207,11 @@ class CLIRuntime(ClaudeRuntime):
         from ..context_manager import ContextManager
         from ..ext_loader import maybe_handle_message as _ext_maybe
         cm = ContextManager(root=self._project_root)
+        # Pull user metadata (first_name) stashed by relay
+        user_meta = getattr(self, "_user_meta", {}).get(user_id, {})
         ext_reply = _ext_maybe(
             user_message, cm, role_name=self._role_name,
-            history=None, user_id=user_id,
+            history=None, user_id=user_id, first_name=user_meta.get("first_name", ""),
         )
         if ext_reply is not None:
             return ext_reply
@@ -219,7 +225,7 @@ class CLIRuntime(ClaudeRuntime):
             "--print",
             "--output-format", "json",
             "--mcp-config", str(mcp_config),
-            "--allowedTools", "mcp__simply-connect",
+            "--dangerously-skip-permissions",
         ]
 
         if session_id:

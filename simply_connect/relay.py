@@ -162,16 +162,28 @@ class TelegramRelay:
             # Download bytes from Telegram
             file_bytes = self.download_file(file_id)
 
+            # Extension document hook — allows domains to override default staging
+            from .context_manager import ContextManager
+            from .ext_loader import maybe_handle_document as _ext_doc
+            cm = ContextManager()
+            mime_type = (message.get("photo") and "image/jpeg") or \
+                        (message.get("document") and message["document"].get("mime_type", ""))
+            ext_reply = _ext_doc(
+                file_bytes, label, mime_type or "", caption, cm,
+                role_name=self.role_name, user_id=user_id,
+            )
+            if ext_reply is not None:
+                self.send_message(chat_id, ext_reply)
+                return
+
             # Write to temp file so ingest_document() can read it
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
                 f.write(file_bytes)
                 tmp_path = Path(f.name)
 
             # Ingest
-            from .context_manager import ContextManager
             from .ingestion import ingest_document
 
-            cm = ContextManager()
             committed = cm.load_committed()
             result = ingest_document(
                 tmp_path,
@@ -348,6 +360,12 @@ class TelegramRelay:
 
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
+        first_name = message["from"].get("first_name", "")
+
+        # Stash first_name on runtime for extensions to access
+        if not hasattr(self.runtime, "_user_meta"):
+            self.runtime._user_meta = {}
+        self.runtime._user_meta[user_id] = {"first_name": first_name}
 
         # Allowlist check
         allowed = config.allowed_users()

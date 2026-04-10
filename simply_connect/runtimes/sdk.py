@@ -61,9 +61,11 @@ class SDKRuntime(ClaudeRuntime):
 
         # Extension message interception (before Claude) — mirrors cli.py behavior
         from ..ext_loader import maybe_handle_message as _ext_maybe
+        # Pull user metadata (first_name) stashed by relay
+        user_meta = getattr(self, "_user_meta", {}).get(user_id, {})
         ext_reply = _ext_maybe(
             user_message, self._cm, role_name=self._role_name,
-            history=history, user_id=user_id,
+            history=history, user_id=user_id, first_name=user_meta.get("first_name", ""),
         )
         if ext_reply is not None:
             self._sm.add_turn(session_id, "user", user_message)
