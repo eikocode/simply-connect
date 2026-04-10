@@ -81,6 +81,21 @@ Operator says "remember this"
 
 Admin can be a human, an AI process (`--auto`), or both.
 
+### Domain Roles
+
+Beyond the framework roles, domains can define **domain roles** in `profile.json` — each with its own context filter, AGENT.md, and Telegram bot. Domain roles write to session memory rather than staging directly. A curator agent evaluates session captures and promotes worthy items to staging.
+
+```json
+{
+  "domain_roles": {
+    "finance": {"trust_weight": 0.8},
+    "housekeeping": {"trust_weight": 0.3}
+  }
+}
+```
+
+See [Mediated Knowledge Pipeline](#mediated-knowledge-pipeline) below for details.
+
 ---
 
 ## Domain System
@@ -559,6 +574,55 @@ pytest tests/ -v
 ```
 
 Tests use mock API clients and in-memory fixtures — no API key required.
+
+---
+
+## Mediated Knowledge Pipeline
+
+The next design introduces a **mediated knowledge pipeline** where domain roles write to session memory instead of staging directly. A curator agent evaluates session content and promotes worthy items to staging.
+
+### Before vs After
+
+**Before:**
+```
+Domain role says "remember this" → staging → admin review → committed
+```
+
+**After:**
+```
+Domain role says "remember this" → session memory → curator agent → staging → admin review → committed
+```
+
+Framework roles (`sc` / `sc-admin`) are unchanged — they continue writing directly to staging.
+
+### Curator Agent
+
+The curator is a model-driven evaluator that:
+- Reads session captures (stored as `role="capture"` turns)
+- Evaluates each against promotion criteria (enduring knowledge vs. operational ephemera, contradiction detection, source trust weight)
+- Promotes worthy items to staging with `source="curator:{role}:{session_id}"`
+
+```bash
+sc-admin curate                  # curate most recent session with captures
+sc-admin curate --session <id>   # curate specific session
+sc-admin curate --all            # curate all sessions
+sc-admin curate --dry-run        # show recommendations without side effects
+```
+
+### Trust Hierarchy
+
+The agent reasons across context layers with an explicit trust ordering:
+1. **Committed context** — ground truth, full trust
+2. **Staging** — usable but flagged as unconfirmed
+3. **Session memory** — ephemeral, lowest trust
+
+When layers conflict, committed context always wins.
+
+### Staging Entry Provenance
+
+Staging entries now carry:
+- `source_role` — who originated the capture (extracted from source)
+- `curated` — whether the entry came through the curator agent
 
 ---
 

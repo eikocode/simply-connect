@@ -6,6 +6,7 @@ simply_connect/brain.py
 simply_connect/cli.py
 simply_connect/config.py
 simply_connect/context_manager.py
+simply_connect/curator.py
 simply_connect/ext_loader.py
 simply_connect/ingestion.py
 simply_connect/mcp_server.py
@@ -28,10 +29,13 @@ tests/test_brain_tools.py
 tests/test_cli_tools.py
 tests/test_context_manager.py
 tests/test_context_manager_starters.py
+tests/test_curator.py
 tests/test_domain_startup.py
+tests/test_e2e_next_design.py
 tests/test_extensions_loader.py
 tests/test_ingestion_parser.py
 tests/test_legal_contracts_domain.py
+tests/test_mcp_server.py
 tests/test_minpaku_super_landlord_domain.py
 tests/test_multi_role.py
 tests/test_new_domain.py
