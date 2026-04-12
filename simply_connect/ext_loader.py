@@ -128,6 +128,28 @@ def maybe_handle_document(file_bytes: bytes, filename: str, mime_type: str, capt
     return None
 
 
+def handle_web_onboarding_complete(data: dict, cm) -> dict | None:
+    """Give active extensions a chance to run domain-specific logic after web onboarding completes.
+
+    Extensions can optionally expose:
+        handle_web_onboarding_complete(data, cm) -> dict | None
+
+    `data` is the full request body dict. Returns a dict to merge into the response,
+    or None. Non-fatal — errors are logged and skipped.
+    """
+    for ext in load_active_extensions(cm):
+        handler = getattr(ext["module"], "handle_web_onboarding_complete", None)
+        if handler is None:
+            continue
+        try:
+            result = handler(data, cm)
+            if result:
+                return result
+        except Exception as e:
+            log.warning(f"Extension handle_web_onboarding_complete failed (non-fatal): {e}")
+    return None
+
+
 def maybe_handle_message(message: str, cm, role_name: str = "operator", history: list[dict] | None = None, **kwargs) -> str | None:
     """Give active extensions a chance to deterministically handle a raw user message.
 

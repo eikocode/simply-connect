@@ -242,7 +242,7 @@ class CLIRuntime(ClaudeRuntime):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,
                 cwd=str(self._project_root),
             )
 
@@ -326,7 +326,7 @@ class _JSONLSubprocessRuntime(ClaudeRuntime):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,
                 cwd=str(self._project_root),
                 env=env,
             )

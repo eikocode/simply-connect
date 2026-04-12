@@ -31,6 +31,7 @@ simply-connect-admin = "simply_connect.admin_cli:admin_main"
 sc-admin = "simply_connect.admin_cli:admin_main"
 sc-relay = "simply_connect.relay:main"
 sc-mcp = "simply_connect.mcp_server:main"
+sc-web = "simply_connect.web_relay:main"
 
 # Legacy aliases for backward compatibility
 super-contract = "simply_connect.cli:main"
