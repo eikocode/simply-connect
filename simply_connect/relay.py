@@ -16,6 +16,7 @@ Usage:
   python -m simply_connect.relay
   sc-relay
 """
+import json
 import logging
 import os
 import queue
@@ -63,12 +64,20 @@ class _DocJob:
     mime_type: str
     caption: str
     role_name: str
+    source: str = "telegram"           # "telegram" | "web"
+    job_path: "Path | None" = None     # sidecar JSON path for web uploads
 
 
 class DocumentWorker:
-    """Background daemon thread — processes document jobs one at a time."""
+    """Background daemon thread — processes document jobs one at a time.
 
-    TYPING_INTERVAL = 5  # seconds between typing indicators
+    Sources:
+      - Telegram uploads: enqueued directly via enqueue() from handle_document()
+      - Web uploads: discovered by _dir_watcher() scanning SC_WEB_UPLOAD_DIR
+    """
+
+    TYPING_INTERVAL = 5    # seconds between typing indicators
+    DIR_POLL_INTERVAL = 2  # seconds between directory scans
 
     def __init__(self, relay: "TelegramRelay") -> None:
         self._relay = relay
@@ -76,12 +85,106 @@ class DocumentWorker:
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="doc-worker"
         )
+        self._dir_thread = threading.Thread(
+            target=self._dir_watcher, daemon=True, name="doc-dir-watcher"
+        )
+        self._seen_jobs: set[str] = set()  # sidecar basenames already enqueued this session
 
     def start(self) -> None:
+        self._drain_upload_dir()   # crash-recovery: pick up any leftover jobs
         self._thread.start()
+        self._dir_thread.start()
 
     def enqueue(self, job: _DocJob) -> None:
         self._queue.put(job)
+
+    # ------------------------------------------------------------------
+    # Directory-based queue support (web uploads)
+    # ------------------------------------------------------------------
+
+    def _upload_dir(self) -> Path:
+        return config.web_upload_dir()
+
+    def _drain_upload_dir(self) -> None:
+        """On startup: enqueue any .json sidecars already sitting in the upload dir."""
+        try:
+            for sidecar in sorted(self._upload_dir().glob("*.json")):
+                self._enqueue_from_sidecar(sidecar)
+        except Exception as e:
+            log.warning(f"DocumentWorker: cannot drain upload dir: {e}")
+
+    def _dir_watcher(self) -> None:
+        """Poll upload directory every DIR_POLL_INTERVAL seconds for new jobs."""
+        while True:
+            try:
+                for sidecar in sorted(self._upload_dir().glob("*.json")):
+                    self._enqueue_from_sidecar(sidecar)
+            except Exception as e:
+                log.warning(f"DocumentWorker dir-watcher error: {e}")
+            time.sleep(self.DIR_POLL_INTERVAL)
+
+    def _enqueue_from_sidecar(self, sidecar: Path) -> None:
+        """Read a .json sidecar + matching binary file and enqueue a _DocJob."""
+        key = sidecar.name
+        if key in self._seen_jobs:
+            return
+
+        try:
+            meta = json.loads(sidecar.read_text())
+        except Exception as e:
+            log.warning(f"DocumentWorker: bad sidecar {sidecar}: {e}")
+            self._seen_jobs.add(key)  # skip permanently to avoid log spam
+            return
+
+        stem = sidecar.stem
+        suffix = _MIME_TO_SUFFIX.get(meta.get("mime_type", ""), ".bin")
+        bin_path = sidecar.parent / f"{stem}{suffix}"
+
+        if not bin_path.exists():
+            log.warning(f"DocumentWorker: missing binary for {sidecar}, skipping")
+            self._seen_jobs.add(key)
+            return
+
+        try:
+            file_bytes = bin_path.read_bytes()
+        except Exception as e:
+            log.warning(f"DocumentWorker: cannot read {bin_path}: {e}")
+            return  # don't mark seen — will retry next poll
+
+        self._seen_jobs.add(key)
+        job = _DocJob(
+            chat_id=meta.get("chat_id", 0),
+            user_id=meta.get("user_id", 0),
+            file_bytes=file_bytes,
+            filename=meta.get("filename", bin_path.name),
+            mime_type=meta.get("mime_type", "application/octet-stream"),
+            caption=meta.get("caption", ""),
+            role_name=meta.get("role_name", "operator"),
+            source="web",
+            job_path=sidecar,
+        )
+        log.info(f"DocumentWorker: enqueuing web upload {stem} ({job.filename})")
+        self._queue.put(job)
+
+    def _cleanup_job_files(self, job: _DocJob) -> None:
+        """Delete sidecar JSON and binary file after successful processing."""
+        if job.job_path is None:
+            return
+        sidecar = job.job_path
+        stem = sidecar.stem
+        suffix = _MIME_TO_SUFFIX.get(job.mime_type, ".bin")
+        bin_path = sidecar.parent / f"{stem}{suffix}"
+        for path in (sidecar, bin_path):
+            try:
+                if path.exists():
+                    path.unlink()
+                    log.debug(f"DocumentWorker: deleted {path}")
+            except Exception as e:
+                log.warning(f"DocumentWorker: could not delete {path}: {e}")
+
+    # ------------------------------------------------------------------
+    # Worker loop
+    # ------------------------------------------------------------------
 
     def _run(self) -> None:
         while True:
@@ -90,13 +193,15 @@ class DocumentWorker:
                 self._process(job)
             except Exception as e:
                 log.exception(f"DocumentWorker: job failed for chat {job.chat_id}: {e}")
-                try:
-                    self._relay.send_message(
-                        job.chat_id,
-                        f"⚠️ Failed to process document:\n<code>{e}</code>",
-                    )
-                except Exception:
-                    pass
+                if job.source == "telegram":
+                    try:
+                        self._relay.send_message(
+                            job.chat_id,
+                            f"⚠️ Failed to process document:\n<code>{e}</code>",
+                        )
+                    except Exception:
+                        pass
+                # Web jobs: log only, no Telegram chat to notify
             finally:
                 self._queue.task_done()
 
@@ -105,15 +210,17 @@ class DocumentWorker:
         from .ext_loader import maybe_handle_document as _ext_doc
         from .ingestion import ingest_document
 
-        # Start typing keepalive for duration of processing
+        # Typing keepalive only for Telegram jobs
         stop_typing = threading.Event()
-        typing_thread = threading.Thread(
-            target=self._typing_loop,
-            args=(job.chat_id, stop_typing),
-            daemon=True,
-            name="doc-typing",
-        )
-        typing_thread.start()
+        typing_thread = None
+        if job.source == "telegram":
+            typing_thread = threading.Thread(
+                target=self._typing_loop,
+                args=(job.chat_id, stop_typing),
+                daemon=True,
+                name="doc-typing",
+            )
+            typing_thread.start()
 
         tmp_path = None
         try:
@@ -125,7 +232,11 @@ class DocumentWorker:
                 role_name=job.role_name, user_id=job.user_id,
             )
             if ext_reply is not None:
-                self._relay._send_chunked(job.chat_id, ext_reply)
+                if job.source == "telegram":
+                    self._relay._send_chunked(job.chat_id, ext_reply)
+                else:
+                    log.info(f"DocumentWorker: web upload processed OK: {job.filename}")
+                self._cleanup_job_files(job)
                 return
 
             # Default staging fallback (non-save-my-brain deployments)
@@ -141,18 +252,24 @@ class DocumentWorker:
             )
 
             if not result.get("success"):
-                self._relay.send_message(
-                    job.chat_id,
-                    f"⚠️ Could not read document:\n<code>{result.get('error', 'unknown error')}</code>",
-                )
+                if job.source == "telegram":
+                    self._relay.send_message(
+                        job.chat_id,
+                        f"⚠️ Could not read document:\n<code>{result.get('error', 'unknown error')}</code>",
+                    )
+                else:
+                    log.warning(f"DocumentWorker: web ingest failed: {result.get('error')}")
+                self._cleanup_job_files(job)
                 return
 
             extractions = result.get("extractions", [])
             if not extractions:
-                self._relay.send_message(
-                    job.chat_id,
-                    "📄 Document read — no structured content found to stage.",
-                )
+                if job.source == "telegram":
+                    self._relay.send_message(
+                        job.chat_id,
+                        "📄 Document read — no structured content found to stage.",
+                    )
+                self._cleanup_job_files(job)
                 return
 
             staged = 0
@@ -168,18 +285,24 @@ class DocumentWorker:
                 )
                 staged += 1
 
-            parser_label = result.get("parser", config.DOCUMENT_PARSER)
-            reply = (
-                f"📄 <b>{staged} item{'s' if staged != 1 else ''} staged for review</b>\n\n"
-                f"Parser: <code>{parser_label}</code>"
-            )
-            if job.caption:
-                reply += f"\n\nCaption: <i>{job.caption}</i>"
-            self._relay._send_chunked(job.chat_id, reply)
+            if job.source == "telegram":
+                parser_label = result.get("parser", config.DOCUMENT_PARSER)
+                reply = (
+                    f"📄 <b>{staged} item{'s' if staged != 1 else ''} staged for review</b>\n\n"
+                    f"Parser: <code>{parser_label}</code>"
+                )
+                if job.caption:
+                    reply += f"\n\nCaption: <i>{job.caption}</i>"
+                self._relay._send_chunked(job.chat_id, reply)
+            else:
+                log.info(f"DocumentWorker: web upload staged {staged} items from {job.filename}")
+
+            self._cleanup_job_files(job)
 
         finally:
             stop_typing.set()
-            typing_thread.join(timeout=2)
+            if typing_thread is not None:
+                typing_thread.join(timeout=2)
             if tmp_path and tmp_path.exists():
                 try:
                     os.unlink(tmp_path)

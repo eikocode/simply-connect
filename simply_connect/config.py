@@ -12,6 +12,8 @@ Variables:
   SC_INTELLIGENCE_MODEL      — "haiku" (default), "sonnet", or "auto" (domain decides per-type)
   SC_FORCE_VISION            — "1" to skip EYES text extraction and always use Claude vision
   SC_LLM_BACKEND             — "anthropic" (default), "openai", or "gemini" (future)
+  SC_WEB_UPLOAD_DIR          — Directory for web upload queue jobs (default: ~/.simply-connect/web-uploads/)
+  SC_WEB_UPLOAD_TOKEN        — Shared secret token for /upload endpoint auth
 """
 import os
 
@@ -30,6 +32,8 @@ class Config:
     INTELLIGENCE_MODEL: str = "haiku"
     FORCE_VISION: bool = False
     LLM_BACKEND: str = "anthropic"
+    WEB_UPLOAD_DIR: str = ""
+    WEB_UPLOAD_TOKEN: str = ""
 
     def __init__(self) -> None:
         self.reload()
@@ -44,6 +48,16 @@ class Config:
         self.INTELLIGENCE_MODEL = os.getenv("SC_INTELLIGENCE_MODEL", "haiku")
         self.FORCE_VISION = os.getenv("SC_FORCE_VISION", "").strip() in ("1", "true", "yes")
         self.LLM_BACKEND = os.getenv("SC_LLM_BACKEND", "anthropic").strip().lower()
+        self.WEB_UPLOAD_DIR = os.getenv("SC_WEB_UPLOAD_DIR", "").strip()
+        self.WEB_UPLOAD_TOKEN = os.getenv("SC_WEB_UPLOAD_TOKEN", "").strip()
+
+    def web_upload_dir(self) -> "Path":
+        """Return Path to web upload queue directory, creating it if needed."""
+        from pathlib import Path
+        raw = self.WEB_UPLOAD_DIR or "~/.simply-connect/web-uploads"
+        p = Path(raw).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
     def allowed_users(self) -> list[int]:
         """Return list of allowed Telegram user IDs. Empty means all allowed."""
