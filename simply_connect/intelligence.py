@@ -7,33 +7,36 @@ imports — this module has zero domain knowledge.
 
 Pipeline:
   1. EYES: PyMuPDF (coordinate-aware) → Docling fallback (scanned PDFs / images)
-  2. Phase A: Classify via Claude — doc_type, language, detected_names, currency
+  2. Phase A: Classify — doc_type, language, detected_names, currency
   3. Phase B: Extract structured JSON per doc_type schema
 
-Claude access (cheapest path first):
-  1. ANTHROPIC_API_KEY set → Anthropic SDK (Haiku, ~$0.0003/doc)
-  2. claude CLI in PATH    → OAuth subscription, no API key needed
-  3. Neither               → local-only fallback, text stored, no AI analysis
+LLM backend (cheapest path first, default Anthropic):
+  SC_LLM_BACKEND=anthropic  — Claude SDK (ANTHROPIC_API_KEY) or CLI subprocess
+  SC_LLM_BACKEND=openai     — GPT-4o (OPENAI_API_KEY) [future]
+  SC_LLM_BACKEND=gemini     — Gemini (GOOGLE_API_KEY) [future]
+
+Within the Anthropic backend:
+  ANTHROPIC_API_KEY set → SDK direct (~$0.0003/doc for Haiku)
+  claude CLI in PATH    → OAuth subscription, no API key needed
+  Neither               → local-only fallback, text stored, no AI analysis
 
 The schemas dict passed to process_document() must contain:
   classify_schema:           str   — Phase A JSON schema template (with doc_type taxonomy)
   extraction_schemas:        dict  — Phase B: doc_type → JSON schema template string
   default_extraction_schema: str   — fallback schema for unknown doc types
   complex_doc_types:         set   — these types get sonnet_model instead of haiku_model
-  haiku_model:               str   — fast/cheap model (e.g. "claude-haiku-4-5")
-  sonnet_model:              str   — reasoning model (e.g. "claude-sonnet-4-5")
+  haiku_model:               str   — fast/cheap model identifier
+  sonnet_model:              str   — reasoning model identifier
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import os
-import shutil
-import subprocess
 from datetime import datetime
 from typing import Any
+
+from .backends import LLMBackend, get_backend
 
 log = logging.getLogger(__name__)
 
@@ -58,115 +61,24 @@ Return ONLY the JSON, no markdown fences, no explanation."""
 
 
 # ---------------------------------------------------------------------------
-# Claude access helpers
+# JSON helpers
 # ---------------------------------------------------------------------------
-
-def _has_api_key() -> bool:
-    return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
-
-
-def _has_cli() -> bool:
-    return shutil.which("claude") is not None
-
-
-def _claude_client():
-    import anthropic
-    return anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-
-def _call_claude(client, model: str, system: str, messages: list[dict],
-                 max_tokens: int = 4096) -> str:
-    response = client.messages.create(
-        model=model, max_tokens=max_tokens, system=system, messages=messages,
-    )
-    return response.content[0].text
-
-
-def _sanitise_text(text: str) -> str:
-    """Strip non-printable / binary characters that break CLI arg passing."""
-    import unicodedata
-    return "".join(
-        ch for ch in text
-        if ch == "\n" or ch == "\t" or (not unicodedata.category(ch).startswith("C"))
-    )
-
-
-def _call_claude_cli_once(system: str, user_content: str, timeout: int = 150) -> str:
-    """One-shot claude CLI call. Content passed via stdin to avoid ARG_MAX limits."""
-    clean_content = _sanitise_text(user_content)
-    clean_system = _sanitise_text(system)
-
-    cmd = [
-        "claude",
-        "--print",
-        "--output-format", "json",
-        "--model", "claude-haiku-4-5",
-        "--system-prompt", clean_system,
-        "--dangerously-skip-permissions",
-    ]
-    result = subprocess.run(
-        cmd,
-        input=clean_content,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI failed (rc={result.returncode}): {result.stderr[:200]}"
-        )
-    stdout = result.stdout.strip()
-    if not stdout:
-        raise RuntimeError("claude CLI returned empty output")
-    try:
-        data = json.loads(stdout)
-        return data.get("result") or data.get("text") or ""
-    except json.JSONDecodeError:
-        return stdout
-
-
-def _call_intelligence(system: str, user_content: str, model: str | None = None,
-                       max_tokens: int = 4096, cli_timeout: int = 150) -> str:
-    """Route: SDK if API key available, CLI otherwise. Raises if neither."""
-    if _has_api_key():
-        client = _claude_client()
-        messages = [{"role": "user", "content": user_content}]
-        return _call_claude(client, model or "claude-haiku-4-5", system, messages, max_tokens)
-    elif _has_cli():
-        return _call_claude_cli_once(system, user_content, timeout=cli_timeout)
-    else:
-        raise RuntimeError("No Claude access: set ANTHROPIC_API_KEY or install claude CLI")
-
 
 def _parse_json(raw: str) -> dict:
     try:
         clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         return json.loads(clean)
     except json.JSONDecodeError:
-        log.warning(f"Could not parse Claude JSON. Raw: {raw[:300]}")
+        log.warning(f"Could not parse LLM JSON response. Raw: {raw[:300]}")
         return {}
-
-
-def _image_content_block(file_bytes: bytes, mime_type: str) -> dict:
-    media_type = mime_type if mime_type in (
-        "image/jpeg", "image/png", "image/gif", "image/webp"
-    ) else "image/jpeg"
-    return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": media_type,
-            "data": base64.standard_b64encode(file_bytes).decode("utf-8"),
-        },
-    }
 
 
 # ---------------------------------------------------------------------------
 # Phase A — Classify
 # ---------------------------------------------------------------------------
 
-def classify_text(text: str, classify_schema: str) -> dict:
-    """Classify a document from its extracted text. Routes SDK → CLI → keyword fallback."""
+def classify_text(text: str, classify_schema: str, backend: LLMBackend) -> dict:
+    """Classify a document from its extracted text."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     system = f"""You are a document classifier.
 Today's date is {today}.
@@ -175,22 +87,28 @@ Return ONLY this JSON:
 {classify_schema}"""
 
     try:
-        raw = _call_intelligence(system, f"Classify this document:\n\n{text[:3000]}")
+        raw = backend.complete(system, f"Classify this document:\n\n{text[:3000]}",
+                               model="claude-haiku-4-5")
         result = _parse_json(raw)
     except Exception as e:
-        log.exception(f"Classification call failed: {e}")
+        log.exception(f"classify_text failed: {e}")
         return _fallback_classification(text)
 
     return _fill_classification_defaults(result)
 
 
-def classify_image(file_bytes: bytes, mime_type: str, classify_schema: str,
-                   text_hint: str = "") -> dict:
+def classify_image(
+    file_bytes: bytes,
+    mime_type: str,
+    classify_schema: str,
+    backend: LLMBackend,
+    text_hint: str = "",
+) -> dict:
     """Classify from the raw image.
 
-    SDK path: Claude Vision (best).
-    CLI path: text-hint only (filename/caption) — CLI cannot receive image bytes.
-    Fallback: keyword heuristics.
+    Vision path: backend.complete_vision() — best results.
+    Text-hint fallback: when backend.supports_vision() is False, classifies
+    from filename/caption only.
     """
     today = datetime.utcnow().strftime("%Y-%m-%d")
     system = f"""You are a document classifier.
@@ -199,38 +117,36 @@ Classify this document and detect any person names mentioned.
 Return ONLY this JSON:
 {classify_schema}"""
 
-    if _has_api_key():
+    if backend.supports_vision():
         try:
-            client = _claude_client()
-            content = [
-                _image_content_block(file_bytes, mime_type),
-                {"type": "text", "text": "Classify this document image. Detect any person names."},
-            ]
-            raw = _call_claude(client, "claude-haiku-4-5", system,
-                               [{"role": "user", "content": content}], max_tokens=512)
-            result = _parse_json(raw)
-        except Exception as e:
-            log.exception(f"Vision classification failed: {e}")
-            return _fallback_classification(text_hint)
-        return _fill_classification_defaults(result)
-
-    elif _has_cli():
-        hint = (text_hint or "").strip() or "unknown document"
-        log.info("classify_image: no API key, using CLI text-hint classification")
-        try:
-            raw = _call_claude_cli_once(
-                system,
-                f"Classify this document based on its filename/caption: {hint}\n"
-                f"(Image content unavailable — classify from filename only.)",
+            raw = backend.complete_vision(
+                system, file_bytes, mime_type,
+                "Classify this document image. Detect any person names.",
+                model="claude-haiku-4-5",
+                max_tokens=512,
             )
             result = _parse_json(raw)
         except Exception as e:
-            log.exception(f"CLI hint classification failed: {e}")
+            log.exception(f"classify_image (vision) failed: {e}")
             return _fallback_classification(text_hint)
         return _fill_classification_defaults(result)
 
     else:
-        return _fallback_classification(text_hint)
+        # No vision — use text hint (filename / caption)
+        hint = (text_hint or "").strip() or "unknown document"
+        log.info(f"classify_image: backend {backend.name()!r} has no vision, using text hint")
+        try:
+            raw = backend.complete(
+                system,
+                f"Classify this document based on its filename/caption: {hint}\n"
+                f"(Image content unavailable — classify from filename only.)",
+                model="claude-haiku-4-5",
+            )
+            result = _parse_json(raw)
+        except Exception as e:
+            log.exception(f"classify_image (text hint) failed: {e}")
+            return _fallback_classification(text_hint)
+        return _fill_classification_defaults(result)
 
 
 def _fill_classification_defaults(result: dict) -> dict:
@@ -244,7 +160,7 @@ def _fill_classification_defaults(result: dict) -> dict:
 
 
 def _fallback_classification(text: str) -> dict:
-    """Keyword heuristic fallback when no Claude access."""
+    """Keyword heuristic fallback when no LLM access."""
     text_lower = (text or "").lower()
     doc_type = "other"
     if any(kw in text_lower for kw in ("receipt", "收據", "total", "subtotal")):
@@ -259,11 +175,17 @@ def _fallback_classification(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase B — Extract structured data
+# Phase B — Extract
 # ---------------------------------------------------------------------------
 
-def extract_text_mode(text: str, doc_type: str, extraction_schema: str, model: str,
-                      user_language: str = "en") -> dict:
+def extract_text_mode(
+    text: str,
+    doc_type: str,
+    extraction_schema: str,
+    model: str,
+    backend: LLMBackend,
+    user_language: str = "en",
+) -> dict:
     """Extract structured data from text using a domain-provided schema."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -291,15 +213,15 @@ CATEGORISATION — base category strictly on the merchant name, not assumptions.
 
     is_large = doc_type in ("bank_statement", "credit_card")
     max_tokens = 8192 if is_large else 4096
-    max_chars = 150_000 if _has_api_key() else 8_000
+    # Larger context window when SDK available (AnthropicBackend with API key)
+    max_chars = 150_000 if backend.supports_vision() else 8_000
     user_content = f"Document content:\n\n{(text or '')[:max_chars]}"
 
     try:
-        raw = _call_intelligence(system, user_content, model=model,
-                                 max_tokens=max_tokens, cli_timeout=150)
+        raw = backend.complete(system, user_content, model=model, max_tokens=max_tokens)
         result = _parse_json(raw)
     except Exception as e:
-        log.exception(f"Text extraction call failed: {e}")
+        log.exception(f"extract_text_mode failed: {e}")
         char_count = len(text or "")
         return {
             "summary": f"Large document stored ({char_count:,} chars). Ask me to summarize it.",
@@ -312,13 +234,23 @@ CATEGORISATION — base category strictly on the merchant name, not assumptions.
     return _fill_extraction_defaults(result)
 
 
-def extract_vision_mode(file_bytes: bytes, mime_type: str, doc_type: str,
-                        extraction_schema: str, model: str,
-                        user_language: str = "en") -> dict:
-    """Extract structured data from raw image via Claude Vision (SDK only).
+def extract_vision_mode(
+    file_bytes: bytes,
+    mime_type: str,
+    doc_type: str,
+    extraction_schema: str,
+    model: str,
+    backend: LLMBackend,
+    user_language: str = "en",
+) -> dict:
+    """Extract structured data from raw image via backend vision.
 
-    CLI path cannot pass image bytes via subprocess — falls back to empty extraction.
+    Falls back to empty extraction if backend does not support vision.
     """
+    if not backend.supports_vision():
+        log.info(f"extract_vision_mode: backend {backend.name()!r} has no vision, skipping")
+        return _empty_extraction()
+
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
     lang_instruction = {
@@ -342,27 +274,18 @@ SUMMARY — plain text only, no markdown, no headers, no tables, no bullet point
 HISTORICAL STATEMENTS — do NOT flag past due dates as overdue emergencies.
 CATEGORISATION — base category strictly on the merchant name."""
 
-    if not _has_api_key():
-        log.info("extract_vision_mode: no API key, skipping vision extraction")
-        return _empty_extraction()
-
-    try:
-        client = _claude_client()
-    except Exception:
-        return _empty_extraction()
-
-    content = [
-        _image_content_block(file_bytes, mime_type),
-        {"type": "text", "text": "Extract structured information from this document."},
-    ]
     max_tokens = 8192 if doc_type in ("bank_statement", "credit_card") else 4096
 
     try:
-        raw = _call_claude(client, model, system,
-                           [{"role": "user", "content": content}], max_tokens)
+        raw = backend.complete_vision(
+            system, file_bytes, mime_type,
+            "Extract structured information from this document.",
+            model=model,
+            max_tokens=max_tokens,
+        )
         result = _parse_json(raw)
     except Exception as e:
-        log.exception(f"Vision extraction failed: {e}")
+        log.exception(f"extract_vision_mode failed: {e}")
         return _empty_extraction()
 
     return _fill_extraction_defaults(result)
@@ -392,6 +315,7 @@ def process_document(
     schemas: dict,
     user_language: str = "en",
     force_vision: bool = False,
+    backend: LLMBackend | None = None,
 ) -> dict[str, Any]:
     """
     Full hybrid document intelligence pipeline.
@@ -405,6 +329,8 @@ def process_document(
                          complex_doc_types, haiku_model, sonnet_model
         user_language: "en", "zh-tw", "zh", "ja" — controls summary language.
         force_vision:  Skip EYES and go straight to vision path.
+        backend:       LLMBackend instance. If None, reads SC_LLM_BACKEND env var
+                       (default: AnthropicBackend).
 
     Returns dict with:
         doc_type, summary, key_points, important_dates, red_flags, action_items,
@@ -413,6 +339,9 @@ def process_document(
     """
     from . import eyes
 
+    if backend is None:
+        backend = get_backend()
+
     classify_schema = schemas.get("classify_schema", DEFAULT_CLASSIFY_SCHEMA)
     extraction_schemas = schemas.get("extraction_schemas", {})
     default_schema = schemas.get("default_extraction_schema", DEFAULT_GENERIC_SCHEMA)
@@ -420,8 +349,8 @@ def process_document(
     haiku = schemas.get("haiku_model", "claude-haiku-4-5")
     sonnet = schemas.get("sonnet_model", "claude-haiku-4-5")  # fallback to haiku if not set
 
-    # Local-only fallback: no API key AND no CLI
-    if not _has_api_key() and not _has_cli():
+    # Local-only fallback: backend not available at all
+    if not backend.is_available():
         try:
             eyes_result = eyes.extract_text(file_bytes, mime_type, filename)
             extracted = eyes_result.text.strip()
@@ -436,13 +365,13 @@ def process_document(
             )
             key_points = [
                 f"Full text available ({char_count:,} chars) — ready for questions.",
-                "Add ANTHROPIC_API_KEY or install claude CLI to enable automatic classification.",
+                f"Set SC_LLM_BACKEND credentials to enable automatic classification.",
             ]
         else:
             summary = "Document stored. No text could be extracted — it may be a scanned image."
             key_points = [
                 "No text extracted — may be a scanned or image-only document.",
-                "Add ANTHROPIC_API_KEY or install claude CLI to enable Vision analysis.",
+                "Set SC_LLM_BACKEND credentials to enable Vision analysis.",
             ]
         return {
             "doc_type": "other",
@@ -469,17 +398,20 @@ def process_document(
     )
     use_text_mode = eyes.has_enough_text(eyes_result) and not force_vision
     extraction_method = "text" if use_text_mode else "vision"
-    access = "sdk" if _has_api_key() else "cli"
-    log.info(f"Claude access: {access} | text_mode={use_text_mode}")
+    access = backend.name()
+    if hasattr(backend, "_has_api_key"):
+        access = f"{backend.name()}:sdk" if backend._has_api_key() else f"{backend.name()}:cli"
+    log.info(f"Backend: {access} | text_mode={use_text_mode}")
 
     # Step 2: Classify
     if use_text_mode:
-        classification = classify_text(eyes_result.text, classify_schema)
+        classification = classify_text(eyes_result.text, classify_schema, backend)
     else:
-        classification = classify_image(file_bytes, mime_type, classify_schema,
-                                        text_hint=filename)
+        classification = classify_image(
+            file_bytes, mime_type, classify_schema, backend, text_hint=filename
+        )
     doc_type = classification.get("doc_type", "other")
-    log.info(f"Classified as: {doc_type} (method={extraction_method}, access={access})")
+    log.info(f"Classified as: {doc_type} (method={extraction_method}, backend={access})")
 
     # Step 3: Extract
     extraction_schema = extraction_schemas.get(doc_type, default_schema)
@@ -487,11 +419,11 @@ def process_document(
 
     if use_text_mode:
         extraction = extract_text_mode(
-            eyes_result.text, doc_type, extraction_schema, model, user_language
+            eyes_result.text, doc_type, extraction_schema, model, backend, user_language
         )
     else:
         extraction = extract_vision_mode(
-            file_bytes, mime_type, doc_type, extraction_schema, model, user_language
+            file_bytes, mime_type, doc_type, extraction_schema, model, backend, user_language
         )
 
     # Merge classification into extraction result

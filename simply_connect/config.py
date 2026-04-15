@@ -11,6 +11,7 @@ Variables:
   SC_DOCUMENT_PARSER         — "claude" (default) or "docling" (local, no API key needed)
   SC_INTELLIGENCE_MODEL      — "haiku" (default), "sonnet", or "auto" (domain decides per-type)
   SC_FORCE_VISION            — "1" to skip EYES text extraction and always use Claude vision
+  SC_LLM_BACKEND             — "anthropic" (default), "openai", or "gemini" (future)
 """
 import os
 
@@ -28,6 +29,7 @@ class Config:
     DOCUMENT_PARSER: str = "claude"
     INTELLIGENCE_MODEL: str = "haiku"
     FORCE_VISION: bool = False
+    LLM_BACKEND: str = "anthropic"
 
     def __init__(self) -> None:
         self.reload()
@@ -41,6 +43,7 @@ class Config:
         self.DOCUMENT_PARSER = os.getenv("SC_DOCUMENT_PARSER", "claude")
         self.INTELLIGENCE_MODEL = os.getenv("SC_INTELLIGENCE_MODEL", "haiku")
         self.FORCE_VISION = os.getenv("SC_FORCE_VISION", "").strip() in ("1", "true", "yes")
+        self.LLM_BACKEND = os.getenv("SC_LLM_BACKEND", "anthropic").strip().lower()
 
     def allowed_users(self) -> list[int]:
         """Return list of allowed Telegram user IDs. Empty means all allowed."""
