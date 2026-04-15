@@ -69,6 +69,9 @@ class Config:
         if self.INTELLIGENCE_MODEL not in ("haiku", "sonnet", "auto"):
             print(f"WARNING: SC_INTELLIGENCE_MODEL should be 'haiku', 'sonnet', or 'auto', got '{self.INTELLIGENCE_MODEL}'")
             ok = False
+        if self.LLM_BACKEND not in ("anthropic", "claude", "openai", "codex"):
+            print(f"WARNING: SC_LLM_BACKEND should be 'anthropic' or 'openai', got '{self.LLM_BACKEND}'")
+            ok = False
         # Note: bot token validation is done in relay.main() to support per-role tokens
         return ok
 

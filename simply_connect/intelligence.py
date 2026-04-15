@@ -40,6 +40,15 @@ from .backends import LLMBackend, get_backend
 
 log = logging.getLogger(__name__)
 
+# Module-level reference so tests can patch it cleanly with patch.object().
+# Imported lazily (inside try/except) so this module doesn't hard-depend on
+# PyMuPDF/Docling being installed — process_document raises at call time if
+# eyes is None and the backend is unavailable.
+try:
+    from . import eyes as _eyes_module
+except ImportError:
+    _eyes_module = None  # type: ignore[assignment]
+
 # Minimal fallback schema for deployments that don't provide one
 DEFAULT_GENERIC_SCHEMA = """{
   "summary": "2-3 sentence summary",
@@ -337,7 +346,7 @@ def process_document(
         detected_names, currency, document_language, classification,
         extracted_text, _extraction_method, _eyes_method, _claude_access
     """
-    from . import eyes
+    eyes = _eyes_module  # module-level ref; tests patch _intel._eyes_module
 
     if backend is None:
         backend = get_backend()

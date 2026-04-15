@@ -5,9 +5,9 @@ Backends provide a uniform interface for text and vision completions,
 allowing the pipeline in intelligence.py to be provider-agnostic.
 
 Select backend via SC_LLM_BACKEND env var (default: anthropic):
-  anthropic  — Anthropic Claude SDK or CLI subprocess (default)
-  openai     — OpenAI GPT-4o (requires OPENAI_API_KEY) [future]
-  gemini     — Google Gemini (requires GOOGLE_API_KEY) [future]
+  anthropic  — Anthropic Claude SDK (ANTHROPIC_API_KEY) or claude CLI (OAuth)
+  openai     — OpenAI SDK (OPENAI_API_KEY) or codex CLI (OAuth)
+  gemini     — Google Gemini (GOOGLE_API_KEY) [future]
 
 Domains can also inject a backend directly via process_document(backend=...).
 """
@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from typing import Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ class LLMBackend(Protocol):
         ...
 
     def supports_vision(self) -> bool:
-        """True if complete_vision() will work. False for CLI-only paths."""
+        """True if complete_vision() will work (image bytes accepted)."""
         ...
 
     def complete(
@@ -73,7 +74,7 @@ class LLMBackend(Protocol):
 # ---------------------------------------------------------------------------
 
 class AnthropicBackend:
-    """Anthropic Claude — SDK (API key) with CLI subprocess fallback.
+    """Anthropic Claude — SDK (ANTHROPIC_API_KEY) with claude CLI (OAuth) fallback.
 
     Vision requires ANTHROPIC_API_KEY; CLI path is text-only.
     """
@@ -204,6 +205,241 @@ class AnthropicBackend:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI backend
+# ---------------------------------------------------------------------------
+
+class OpenAIBackend:
+    """OpenAI — SDK (OPENAI_API_KEY) with codex CLI (OAuth) fallback.
+
+    Both paths support vision:
+      SDK:  base64 image_url in message content (GPT-4o / GPT-4o-mini)
+      CLI:  codex exec -i <tempfile>  (writes bytes to temp file, passes via -i flag)
+
+    Model names from Anthropic schemas (e.g. "claude-haiku-4-5") are automatically
+    mapped to OpenAI equivalents. OpenAI model names (e.g. "gpt-4o-mini") pass through.
+    """
+
+    # Anthropic → OpenAI model name mapping
+    _MODEL_MAP: dict[str, str] = {
+        "claude-haiku-4-5":   "gpt-4o-mini",
+        "claude-haiku-3-5":   "gpt-4o-mini",
+        "claude-sonnet-4-5":  "gpt-4o",
+        "claude-sonnet-3-5":  "gpt-4o",
+        "claude-opus-4-5":    "gpt-4o",
+        "claude-opus-3":      "gpt-4o",
+    }
+    _DEFAULT_FAST     = "gpt-4o-mini"
+    _DEFAULT_CAPABLE  = "gpt-4o"
+    _CLI_MODEL        = "gpt-4o-mini"  # model used for codex CLI calls
+
+    def name(self) -> str:
+        return "openai"
+
+    # ---- availability ----
+
+    def is_available(self) -> bool:
+        return self._has_api_key() or self._has_cli()
+
+    def supports_vision(self) -> bool:
+        # Both SDK and codex CLI support vision
+        return self._has_api_key() or self._has_cli()
+
+    def _has_api_key(self) -> bool:
+        return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+    def _has_cli(self) -> bool:
+        return shutil.which("codex") is not None
+
+    # ---- completions ----
+
+    def complete(
+        self,
+        system: str,
+        user_text: str,
+        model: str,
+        max_tokens: int = 4096,
+        cli_timeout: int = 150,
+    ) -> str:
+        resolved = self._resolve_model(model)
+        if self._has_api_key():
+            return self._sdk_complete(system, user_text, resolved, max_tokens)
+        elif self._has_cli():
+            return self._cli_complete(system, user_text, timeout=cli_timeout)
+        raise RuntimeError(
+            "OpenAIBackend.complete(): no OPENAI_API_KEY and no codex CLI found"
+        )
+
+    def complete_vision(
+        self,
+        system: str,
+        file_bytes: bytes,
+        mime_type: str,
+        prompt: str,
+        model: str,
+        max_tokens: int = 4096,
+        cli_timeout: int = 150,
+    ) -> str:
+        resolved = self._resolve_model(model)
+        if self._has_api_key():
+            return self._sdk_vision_complete(
+                system, file_bytes, mime_type, prompt, resolved, max_tokens
+            )
+        elif self._has_cli():
+            return self._cli_vision_complete(
+                system, file_bytes, mime_type, prompt, timeout=cli_timeout
+            )
+        raise RuntimeError(
+            "OpenAIBackend.complete_vision(): no OPENAI_API_KEY and no codex CLI found"
+        )
+
+    # ---- model resolution ----
+
+    def _resolve_model(self, model: str) -> str:
+        """Map Anthropic model names to OpenAI equivalents; pass OpenAI names through."""
+        if model in self._MODEL_MAP:
+            return self._MODEL_MAP[model]
+        if model.startswith(("gpt-", "o1", "o3", "o4")):
+            return model  # already an OpenAI model name
+        log.warning(f"OpenAIBackend: unknown model {model!r}, defaulting to {self._DEFAULT_FAST}")
+        return self._DEFAULT_FAST
+
+    # ---- SDK paths ----
+
+    def _sdk_complete(
+        self, system: str, user_text: str, model: str, max_tokens: int
+    ) -> str:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+        )
+        return resp.choices[0].message.content or ""
+
+    def _sdk_vision_complete(
+        self,
+        system: str,
+        file_bytes: bytes,
+        mime_type: str,
+        prompt: str,
+        model: str,
+        max_tokens: int,
+    ) -> str:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Use safe media type for non-image mime types (e.g. PDF — send as JPEG)
+        media_type = mime_type if mime_type in (
+            "image/jpeg", "image/png", "image/gif", "image/webp"
+        ) else "image/jpeg"
+        b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{b64}"},
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
+        )
+        return resp.choices[0].message.content or ""
+
+    # ---- codex CLI paths ----
+
+    def _cli_complete(self, system: str, user_content: str, timeout: int = 150) -> str:
+        """Text completion via `codex exec`. System prompt is prepended to the prompt."""
+        full_prompt = f"{system}\n\n{user_content}"
+        return self._codex_exec(full_prompt, image_path=None, timeout=timeout)
+
+    def _cli_vision_complete(
+        self,
+        system: str,
+        file_bytes: bytes,
+        mime_type: str,
+        prompt: str,
+        timeout: int = 150,
+    ) -> str:
+        """Vision completion via `codex exec -i <file>`. Writes bytes to temp file."""
+        suffix = {
+            "image/jpeg": ".jpg",
+            "image/png":  ".png",
+            "image/gif":  ".gif",
+            "image/webp": ".webp",
+        }.get(mime_type, ".jpg")
+
+        tmp_img = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(file_bytes)
+                tmp_img = f.name
+            full_prompt = f"{system}\n\n{prompt}"
+            return self._codex_exec(full_prompt, image_path=tmp_img, timeout=timeout)
+        finally:
+            if tmp_img:
+                try:
+                    os.unlink(tmp_img)
+                except Exception:
+                    pass
+
+    def _codex_exec(
+        self, prompt: str, image_path: str | None = None, timeout: int = 150
+    ) -> str:
+        """Core codex exec call. Writes last-message output to a temp file."""
+        tmp_out = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False
+            ) as f:
+                tmp_out = f.name
+
+            cmd = [
+                "codex", "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model", self._CLI_MODEL,
+                "-o", tmp_out,
+            ]
+            if image_path:
+                cmd += ["-i", image_path]
+            cmd.append(prompt)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"codex exec failed (rc={result.returncode}): {result.stderr[:200]}"
+                )
+            with open(tmp_out) as f:
+                output = f.read().strip()
+            if not output:
+                raise RuntimeError("codex exec returned empty output")
+            return output
+
+        finally:
+            if tmp_out:
+                try:
+                    os.unlink(tmp_out)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -216,8 +452,9 @@ def get_backend(name: str | None = None) -> LLMBackend:
         name = os.getenv("SC_LLM_BACKEND", "anthropic").strip().lower()
     if name in ("anthropic", "claude"):
         return AnthropicBackend()
-    # Future providers — raise clearly so the error is actionable
+    if name in ("openai", "codex"):
+        return OpenAIBackend()
     raise ValueError(
         f"Unknown SC_LLM_BACKEND: {name!r}. "
-        "Available now: 'anthropic'. Future: 'openai', 'gemini'."
+        "Available: 'anthropic' (default), 'openai'. Future: 'gemini'."
     )
