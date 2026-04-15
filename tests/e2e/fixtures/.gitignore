@@ -1,0 +1,10 @@
+# Fixture PDFs contain personal financial data — never commit
+*.pdf
+*.PDF
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# But keep this directory itself tracked
+!.gitignore

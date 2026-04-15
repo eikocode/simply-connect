@@ -41,6 +41,11 @@ super-contract-admin = "simply_connect.admin_cli:admin_main"
 where = ["."]
 include = ["simply_connect*"]
 
+[tool.pytest.ini_options]
+markers = [
+    "e2e: live end-to-end test — requires ANTHROPIC_API_KEY and fixture PDFs (pass --e2e to run)",
+]
+
 [tool.black]
 line-length = 100
 

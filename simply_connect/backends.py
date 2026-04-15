@@ -107,7 +107,20 @@ class AnthropicBackend:
         cli_timeout: int = 150,
     ) -> str:
         if self._has_api_key():
-            return self._sdk_complete(system, user_text, model, max_tokens)
+            try:
+                return self._sdk_complete(system, user_text, model, max_tokens)
+            except Exception as e:
+                # 401 / authentication errors mean the key is stale — fall back to CLI
+                if self._has_cli() and (
+                    "401" in str(e) or "authentication" in str(e).lower()
+                    or "invalid x-api-key" in str(e).lower()
+                ):
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "AnthropicBackend: SDK auth failed (%s), falling back to CLI", e
+                    )
+                    return self._cli_complete(system, user_text, timeout=cli_timeout)
+                raise
         elif self._has_cli():
             return self._cli_complete(system, user_text, timeout=cli_timeout)
         raise RuntimeError(
