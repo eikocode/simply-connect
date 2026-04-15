@@ -16,16 +16,22 @@ Usage:
   python -m simply_connect.relay
   sc-relay
 """
+import logging
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
 from .config import config
 from .runtimes import get_runtime
+
+log = logging.getLogger(__name__)
 
 
 # Mime types accepted for document upload
@@ -48,6 +54,147 @@ _MIME_TO_SUFFIX = {
 }
 
 
+@dataclass
+class _DocJob:
+    chat_id: int
+    user_id: int
+    file_bytes: bytes
+    filename: str
+    mime_type: str
+    caption: str
+    role_name: str
+
+
+class DocumentWorker:
+    """Background daemon thread — processes document jobs one at a time."""
+
+    TYPING_INTERVAL = 5  # seconds between typing indicators
+
+    def __init__(self, relay: "TelegramRelay") -> None:
+        self._relay = relay
+        self._queue: queue.Queue[_DocJob] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="doc-worker"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def enqueue(self, job: _DocJob) -> None:
+        self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                self._process(job)
+            except Exception as e:
+                log.exception(f"DocumentWorker: job failed for chat {job.chat_id}: {e}")
+                try:
+                    self._relay.send_message(
+                        job.chat_id,
+                        f"⚠️ Failed to process document:\n<code>{e}</code>",
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._queue.task_done()
+
+    def _process(self, job: _DocJob) -> None:
+        from .context_manager import ContextManager
+        from .ext_loader import maybe_handle_document as _ext_doc
+        from .ingestion import ingest_document
+
+        # Start typing keepalive for duration of processing
+        stop_typing = threading.Event()
+        typing_thread = threading.Thread(
+            target=self._typing_loop,
+            args=(job.chat_id, stop_typing),
+            daemon=True,
+            name="doc-typing",
+        )
+        typing_thread.start()
+
+        tmp_path = None
+        try:
+            cm = ContextManager()
+
+            # Extension hook (save-my-brain intelligence pipeline lives here)
+            ext_reply = _ext_doc(
+                job.file_bytes, job.filename, job.mime_type, job.caption, cm,
+                role_name=job.role_name, user_id=job.user_id,
+            )
+            if ext_reply is not None:
+                self._relay._send_chunked(job.chat_id, ext_reply)
+                return
+
+            # Default staging fallback (non-save-my-brain deployments)
+            suffix = _MIME_TO_SUFFIX.get(job.mime_type, ".bin")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                f.write(job.file_bytes)
+                tmp_path = Path(f.name)
+
+            committed = cm.load_committed()
+            result = ingest_document(
+                tmp_path, committed, cm._profile,
+                parser=config.DOCUMENT_PARSER,
+            )
+
+            if not result.get("success"):
+                self._relay.send_message(
+                    job.chat_id,
+                    f"⚠️ Could not read document:\n<code>{result.get('error', 'unknown error')}</code>",
+                )
+                return
+
+            extractions = result.get("extractions", [])
+            if not extractions:
+                self._relay.send_message(
+                    job.chat_id,
+                    "📄 Document read — no structured content found to stage.",
+                )
+                return
+
+            staged = 0
+            for item in extractions:
+                source_label = f"relay:{job.filename}"
+                if job.caption:
+                    source_label += f" ({job.caption[:40]})"
+                cm.create_staging_entry(
+                    summary=item.get("summary", job.filename),
+                    content=item.get("content", ""),
+                    category=item.get("category", "general"),
+                    source=source_label,
+                )
+                staged += 1
+
+            parser_label = result.get("parser", config.DOCUMENT_PARSER)
+            reply = (
+                f"📄 <b>{staged} item{'s' if staged != 1 else ''} staged for review</b>\n\n"
+                f"Parser: <code>{parser_label}</code>"
+            )
+            if job.caption:
+                reply += f"\n\nCaption: <i>{job.caption}</i>"
+            self._relay._send_chunked(job.chat_id, reply)
+
+        finally:
+            stop_typing.set()
+            typing_thread.join(timeout=2)
+            if tmp_path and tmp_path.exists():
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def _typing_loop(self, chat_id: int, stop: threading.Event) -> None:
+        """Send typing indicator every TYPING_INTERVAL seconds until processing done."""
+        while not stop.wait(timeout=self.TYPING_INTERVAL):
+            try:
+                self._relay.send_typing(chat_id)
+            except Exception:
+                pass
+
+
 class TelegramRelay:
     """Relay messages between Telegram and Claude via the configured runtime."""
 
@@ -58,6 +205,7 @@ class TelegramRelay:
         self.file_url = f"https://api.telegram.org/file/bot{token}"
         self.offset = 0
         self.runtime = get_runtime(config.CLAUDE_RUNTIME, role_name=role_name)
+        self._doc_worker = DocumentWorker(self)
 
     # ------------------------------------------------------------------
     # Telegram API helpers
@@ -129,15 +277,13 @@ class TelegramRelay:
     # ------------------------------------------------------------------
 
     def handle_document(self, chat_id: int, user_id: int, message: dict) -> None:
-        """Handle photo or document upload — ingest into staging."""
+        """Validate, download, and enqueue a document for background processing."""
         caption = message.get("caption", "")
 
-        # Resolve file_id and suffix
         if "photo" in message:
-            # photos are an array of sizes — take the largest
             file_id = message["photo"][-1]["file_id"]
-            suffix = ".jpg"
-            label = "photo"
+            mime_type = "image/jpeg"
+            filename = "photo"
         elif "document" in message:
             doc = message["document"]
             mime_type = doc.get("mime_type", "")
@@ -150,100 +296,26 @@ class TelegramRelay:
                 return
             file_id = doc["file_id"]
             suffix = _MIME_TO_SUFFIX.get(mime_type, ".bin")
-            label = doc.get("file_name", f"document{suffix}")
+            filename = doc.get("file_name", f"document{suffix}")
         else:
             return
 
-        self.send_typing(chat_id)
-        self.send_message(chat_id, f"📄 Reading {label}…")
-
-        tmp_path = None
         try:
-            # Download bytes from Telegram
             file_bytes = self.download_file(file_id)
-
-            # Extension document hook — allows domains to override default staging
-            from .context_manager import ContextManager
-            from .ext_loader import maybe_handle_document as _ext_doc
-            cm = ContextManager()
-            mime_type = (message.get("photo") and "image/jpeg") or \
-                        (message.get("document") and message["document"].get("mime_type", ""))
-            ext_reply = _ext_doc(
-                file_bytes, label, mime_type or "", caption, cm,
-                role_name=self.role_name, user_id=user_id,
-            )
-            if ext_reply is not None:
-                self.send_message(chat_id, ext_reply)
-                return
-
-            # Write to temp file so ingest_document() can read it
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                f.write(file_bytes)
-                tmp_path = Path(f.name)
-
-            # Ingest
-            from .ingestion import ingest_document
-
-            committed = cm.load_committed()
-            result = ingest_document(
-                tmp_path,
-                committed,
-                cm._profile,
-                parser=config.DOCUMENT_PARSER,
-            )
-
-            if not result.get("success"):
-                self.send_message(
-                    chat_id,
-                    f"⚠️ Could not read document:\n<code>{result.get('error', 'unknown error')}</code>",
-                )
-                return
-
-            extractions = result.get("extractions", [])
-            if not extractions:
-                self.send_message(
-                    chat_id,
-                    "📄 Document read — no structured content found to stage.\n\n"
-                    "The document may be empty or contain only template text.",
-                )
-                return
-
-            # Create staging entries
-            staged = 0
-            for item in extractions:
-                source_label = f"relay:{label}"
-                if caption:
-                    source_label += f" ({caption[:40]})"
-                cm.create_staging_entry(
-                    summary=item.get("summary", label),
-                    content=item.get("content", ""),
-                    category=item.get("category", "general"),
-                    source=source_label,
-                )
-                staged += 1
-
-            parser_label = result.get("parser", config.DOCUMENT_PARSER)
-            reply = (
-                f"📄 <b>{staged} item{'s' if staged != 1 else ''} staged for review</b>\n\n"
-                f"Parser: <code>{parser_label}</code>\n"
-                f"Run <code>sc-admin review</code> to approve and commit."
-            )
-            if caption:
-                reply += f"\n\nCaption: <i>{caption}</i>"
-            self.send_message(chat_id, reply)
-
         except Exception as e:
-            log.error(f"handle_document failed: {e}")
-            self.send_message(
-                chat_id,
-                f"⚠️ Failed to process document:\n<code>{e}</code>",
-            )
-        finally:
-            if tmp_path and tmp_path.exists():
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+            self.send_message(chat_id, f"⚠️ Could not download file:\n<code>{e}</code>")
+            return
+
+        self._doc_worker.enqueue(_DocJob(
+            chat_id=chat_id,
+            user_id=user_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            caption=caption,
+            role_name=self.role_name,
+        ))
+        self.send_message(chat_id, f"📄 Got it — analysing <b>{filename}</b>…")
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -394,6 +466,26 @@ class TelegramRelay:
             )
             return
 
+        # Give extensions first crack at every message — including /commands.
+        # This lets domain onboarding FSMs intercept /start before the relay's
+        # generic handler runs.
+        try:
+            from .context_manager import ContextManager
+            from .ext_loader import maybe_handle_message as _ext_msg
+            _cm = ContextManager()
+            ext_reply = _ext_msg(
+                text, _cm,
+                role_name=self.role_name,
+                history=None,
+                user_id=user_id,
+                first_name=first_name,
+            )
+            if ext_reply:
+                self._send_chunked(chat_id, ext_reply)
+                return
+        except Exception as _ext_err:
+            log.warning(f"Extension pre-check failed: {_ext_err}", exc_info=True)
+
         if text.startswith("/"):
             self.handle_command(chat_id, user_id, text)
             return
@@ -416,6 +508,30 @@ class TelegramRelay:
     # Main loop
     # ------------------------------------------------------------------
 
+    def _drain_pending_updates(self) -> None:
+        """Skip all updates queued before this startup to avoid replaying old messages.
+
+        Telegram re-delivers unacknowledged updates on reconnect. Without draining,
+        old messages (e.g. "1" from a previous session) get replayed and can corrupt
+        stateful flows like onboarding. We call getUpdates with offset=-1 to find the
+        latest update_id and set our offset to it — subsequent calls will only return
+        genuinely new messages.
+        """
+        try:
+            response = requests.get(
+                f"{self.api_url}/getUpdates",
+                params={"offset": -1, "timeout": 0},
+                timeout=5,
+            )
+            data = response.json()
+            if data.get("ok"):
+                updates = data.get("result", [])
+                if updates:
+                    self.offset = updates[-1]["update_id"]
+                    print(f"  Skipped pending updates (offset → {self.offset})")
+        except Exception as e:
+            print(f"  Warning: could not drain pending updates: {e}")
+
     def run(self) -> None:
         print("Simply-Connect Telegram Relay starting...")
         print(f"  Runtime:        {config.CLAUDE_RUNTIME}")
@@ -435,6 +551,9 @@ class TelegramRelay:
             print(f"✗ Telegram connection failed: {e}")
             sys.exit(1)
 
+        self._doc_worker.start()
+        print("  Document worker: started")
+        self._drain_pending_updates()
         print("\nWaiting for messages...")
         print("-" * 40)
 
@@ -446,10 +565,6 @@ class TelegramRelay:
                 except Exception as e:
                     print(f"Error handling update: {e}")
             time.sleep(0.5)
-
-
-import logging
-log = logging.getLogger(__name__)
 
 
 def main() -> None:

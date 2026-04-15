@@ -126,7 +126,7 @@ async def handle_onboarding_complete(request: Request) -> JSONResponse:
     if not user_id:
         return JSONResponse({"error": "user_id is required"}, status_code=400)
 
-    first_name = data.get("first_name", "")
+    first_name = (data.get("first_name") or data.get("name") or user_id).strip()
     household_mode = data.get("household_mode", "solo")
     family_members = data.get("family_members", [])
     language = data.get("language", "en")
@@ -252,10 +252,56 @@ async def handle_upload(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Tool dispatch + context endpoints (mirrors web_api.py for mcp.js clients)
+# ---------------------------------------------------------------------------
+
+async def handle_tool(request: Request) -> JSONResponse:
+    """POST /tool/{name} — dispatch an extension tool by name."""
+    tool_name = request.path_params.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        from .context_manager import ContextManager
+        from .ext_loader import dispatch_extension_tool
+        cm = ContextManager()
+        result_str = dispatch_extension_tool(tool_name, body, cm)
+        try:
+            import json as _json
+            return JSONResponse({"success": True, "result": _json.loads(result_str)})
+        except Exception:
+            return JSONResponse({"success": True, "result": result_str})
+    except ValueError as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=404)
+    except Exception as e:
+        log.exception(f"Tool '{tool_name}' failed")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+async def handle_context(request: Request) -> JSONResponse:
+    """GET /context or /context/{category} — return committed context files."""
+    category = request.path_params.get("category", None)
+    try:
+        from .context_manager import ContextManager
+        cm = ContextManager()
+        committed = cm.load_committed()
+        if category:
+            if category not in committed:
+                return JSONResponse({"error": f"Category '{category}' not found"}, status_code=404)
+            return JSONResponse({"category": category, "content": committed[category]})
+        return JSONResponse(committed)
+    except Exception as e:
+        log.exception("Context fetch failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
 def _build_app(allowed_origins: list[str]) -> Starlette:
+    from starlette.routing import Mount
     return Starlette(
         routes=[
             Route("/health", handle_health, methods=["GET"]),
@@ -263,6 +309,9 @@ def _build_app(allowed_origins: list[str]) -> Starlette:
             Route("/onboarding/complete", handle_onboarding_complete, methods=["POST"]),
             Route("/chat", handle_chat, methods=["POST"]),
             Route("/upload", handle_upload, methods=["POST"]),
+            Route("/tool/{name}", handle_tool, methods=["POST"]),
+            Route("/context", handle_context, methods=["GET"]),
+            Route("/context/{category}", handle_context, methods=["GET"]),
         ],
         middleware=[
             Middleware(

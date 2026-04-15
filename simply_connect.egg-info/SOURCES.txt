@@ -13,6 +13,7 @@ simply_connect/mcp_server.py
 simply_connect/relay.py
 simply_connect/session_manager.py
 simply_connect/tools.py
+simply_connect/web_relay.py
 simply_connect.egg-info/PKG-INFO
 simply_connect.egg-info/SOURCES.txt
 simply_connect.egg-info/dependency_links.txt

@@ -3,6 +3,7 @@ sc = simply_connect.cli:main
 sc-admin = simply_connect.admin_cli:admin_main
 sc-mcp = simply_connect.mcp_server:main
 sc-relay = simply_connect.relay:main
+sc-web = simply_connect.web_relay:main
 simply-connect = simply_connect.cli:main
 simply-connect-admin = simply_connect.admin_cli:admin_main
 super-contract = simply_connect.cli:main
