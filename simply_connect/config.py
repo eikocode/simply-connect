@@ -9,6 +9,8 @@ Variables:
   SC_DATA_DIR                — Override for session/staging data directory
   SC_CLAUDE_RUNTIME          — "sdk" (default), "cli"/"claude", "kilo", or "opencode"
   SC_DOCUMENT_PARSER         — "claude" (default) or "docling" (local, no API key needed)
+  SC_INTELLIGENCE_MODEL      — "haiku" (default), "sonnet", or "auto" (domain decides per-type)
+  SC_FORCE_VISION            — "1" to skip EYES text extraction and always use Claude vision
 """
 import os
 
@@ -24,6 +26,8 @@ class Config:
     SC_DATA_DIR: str = ""
     CLAUDE_RUNTIME: str = "sdk"
     DOCUMENT_PARSER: str = "claude"
+    INTELLIGENCE_MODEL: str = "haiku"
+    FORCE_VISION: bool = False
 
     def __init__(self) -> None:
         self.reload()
@@ -35,6 +39,8 @@ class Config:
         self.SC_DATA_DIR = os.getenv("SC_DATA_DIR", "")
         self.CLAUDE_RUNTIME = os.getenv("SC_CLAUDE_RUNTIME", "sdk")
         self.DOCUMENT_PARSER = os.getenv("SC_DOCUMENT_PARSER", "claude")
+        self.INTELLIGENCE_MODEL = os.getenv("SC_INTELLIGENCE_MODEL", "haiku")
+        self.FORCE_VISION = os.getenv("SC_FORCE_VISION", "").strip() in ("1", "true", "yes")
 
     def allowed_users(self) -> list[int]:
         """Return list of allowed Telegram user IDs. Empty means all allowed."""
@@ -57,6 +63,8 @@ class Config:
             ok = False
         if self.DOCUMENT_PARSER not in ("claude", "docling"):
             print(f"ERROR: SC_DOCUMENT_PARSER must be 'claude' or 'docling', got '{self.DOCUMENT_PARSER}'")
+        if self.INTELLIGENCE_MODEL not in ("haiku", "sonnet", "auto"):
+            print(f"WARNING: SC_INTELLIGENCE_MODEL should be 'haiku', 'sonnet', or 'auto', got '{self.INTELLIGENCE_MODEL}'")
             ok = False
         # Note: bot token validation is done in relay.main() to support per-role tokens
         return ok

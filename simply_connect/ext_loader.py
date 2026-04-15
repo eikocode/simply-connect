@@ -150,6 +150,36 @@ def handle_web_onboarding_complete(data: dict, cm) -> dict | None:
     return None
 
 
+def get_document_schemas(cm) -> dict | None:
+    """Ask the active extension for domain document schemas.
+
+    Extensions can optionally expose:
+        get_document_schemas(cm) -> dict
+
+    The returned dict must contain:
+        classify_schema:           str         — Phase A JSON schema template
+        extraction_schemas:        dict[str, str] — Phase B: doc_type → schema template
+        default_extraction_schema: str         — fallback for unknown doc types
+        complex_doc_types:         set[str]    — these types get sonnet_model
+        haiku_model:               str         — fast/cheap model name
+        sonnet_model:              str         — reasoning model name
+
+    Returns the first non-None result, or None if no extension provides schemas.
+    Non-fatal — errors are logged and skipped.
+    """
+    for ext in load_active_extensions(cm):
+        handler = getattr(ext["module"], "get_document_schemas", None)
+        if handler is None:
+            continue
+        try:
+            result = handler(cm)
+            if result:
+                return result
+        except Exception as e:
+            log.warning(f"Extension get_document_schemas failed (non-fatal): {e}")
+    return None
+
+
 def maybe_handle_message(message: str, cm, role_name: str = "operator", history: list[dict] | None = None, **kwargs) -> str | None:
     """Give active extensions a chance to deterministically handle a raw user message.
 

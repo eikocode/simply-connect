@@ -6,13 +6,18 @@ Called by `sc-admin ingest`, the `ingest_document` MCP tool, and the Telegram re
 
 Supported formats:
   .txt, .md           — read as text directly
-  .pdf                — text extraction (pypdf or Docling), vision fallback (Claude)
+  .pdf                — EYES (PyMuPDF coordinate-aware → Docling fallback), vision fallback
   .jpg, .jpeg, .png,
-  .webp, .gif         — Claude vision or Docling
+  .webp, .gif         — EYES (Docling OCR) → Claude vision fallback
 
 Parser selection via SC_DOCUMENT_PARSER env var:
   claude   (default) — Anthropic vision API; requires ANTHROPIC_API_KEY
   docling             — local parsing via Docling; no API key needed for extraction
+
+Intelligence pipeline (activated when extension provides get_document_schemas):
+  When a ContextManager is passed and the active extension exposes get_document_schemas(),
+  the full classify → extract pipeline runs instead of the generic summarisation prompt.
+  Returns a typed extraction (doc_type, transactions, policy, etc.) as staging entries.
 
 Returns a list of extractions, each with summary, content, and category,
 ready to be written as staging entries.
@@ -29,6 +34,19 @@ from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv(usecwd=True), override=False)
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# MIME helpers
+# ---------------------------------------------------------------------------
+
+def _suffix_to_mime(suffix: str) -> str:
+    return {
+        ".pdf": "application/pdf",
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+        ".txt": "text/plain", ".md": "text/plain",
+    }.get(suffix, "application/octet-stream")
 
 
 # ---------------------------------------------------------------------------
@@ -111,31 +129,8 @@ def _read_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _read_pdf_text(path: Path) -> str | None:
-    """
-    Extract text from a PDF using pypdf.
-    Returns None if pypdf is not installed (triggers vision fallback).
-    Returns extracted text string (may be empty for image-only PDFs).
-    """
-    try:
-        import pypdf
-        reader = pypdf.PdfReader(str(path))
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text and text.strip():
-                pages.append(text.strip())
-        return "\n\n".join(pages) if pages else ""
-    except ImportError:
-        log.warning("pypdf not installed — will use vision fallback. Install with: pip install -e '.[pdf]'")
-        return None
-    except Exception as e:
-        log.error(f"PDF text extraction failed: {e}")
-        return None
-
-
 # ---------------------------------------------------------------------------
-# Docling parser
+# Docling parser (explicit SC_DOCUMENT_PARSER=docling path)
 # ---------------------------------------------------------------------------
 
 def _parse_with_docling(filepath: Path) -> str:
@@ -158,7 +153,7 @@ def _parse_with_docling(filepath: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Document-to-text router
+# Document-to-text router (generic path, no intelligence pipeline)
 # ---------------------------------------------------------------------------
 
 def _parse_document_to_text(filepath: Path, api_key: str, parser: str) -> str | None:
@@ -170,7 +165,7 @@ def _parse_document_to_text(filepath: Path, api_key: str, parser: str) -> str | 
         None — format requires direct Claude vision handling (claude parser, image/image-PDF)
 
     The Docling path always returns text — it handles all formats locally.
-    The Claude path returns None for visual formats, which triggers vision handling.
+    The claude path uses EYES for PDF/images, falling back to vision when text is too short.
     """
     suffix = filepath.suffix.lower()
 
@@ -181,19 +176,26 @@ def _parse_document_to_text(filepath: Path, api_key: str, parser: str) -> str | 
     if suffix in (".txt", ".md"):
         return _read_text_file(filepath)
 
-    if suffix == ".pdf":
-        pdf_text = _read_pdf_text(filepath)
-        if pdf_text and pdf_text.strip():
-            return pdf_text
-        # None (pypdf unavailable) or empty (image PDF) → vision fallback
+    # For PDF and images: use EYES (coordinate-aware PyMuPDF + Docling OCR)
+    if suffix in (".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        try:
+            from . import eyes as _eyes
+            mime = _suffix_to_mime(suffix)
+            file_bytes = filepath.read_bytes()
+            eyes_result = _eyes.extract_text(file_bytes, mime, filepath.name)
+            if eyes_result.text.strip():
+                log.info(f"EYES extraction: method={eyes_result.method} len={len(eyes_result.text)}")
+                return eyes_result.text
+        except Exception as e:
+            log.warning(f"EYES extraction failed, falling back to vision: {e}")
+        # EYES got nothing → vision fallback
         return None
 
-    # Images → vision required
     return None
 
 
 # ---------------------------------------------------------------------------
-# Extraction prompt
+# Extraction prompt (generic path)
 # ---------------------------------------------------------------------------
 
 def _build_extraction_prompt(content: str, profile: dict, committed_context: dict[str, str]) -> str:
@@ -265,6 +267,46 @@ def _parse_response(raw: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Intelligence pipeline result → staging entries
+# ---------------------------------------------------------------------------
+
+def _intelligence_result_to_staging(result: dict, profile: dict) -> list[dict]:
+    """Convert a typed intelligence result into staging-entry format."""
+    doc_type = result.get("doc_type", "other")
+    summary = result.get("summary", "")
+    category_map = profile.get("category_map", {})
+
+    content_lines = []
+    if summary:
+        content_lines.append(summary)
+    for pt in result.get("key_points", []):
+        content_lines.append(f"• {pt}")
+    for d in result.get("important_dates", []):
+        content_lines.append(f"📅 {d.get('label', '')}: {d.get('date', '')}")
+    for flag in result.get("red_flags", []):
+        content_lines.append(f"⚠️ {flag.get('clause', '')}: {flag.get('detail', '')}")
+    for item in result.get("action_items", []):
+        content_lines.append(f"→ {item}")
+
+    content = "\n".join(content_lines) or result.get("extracted_text", "")
+
+    # Map doc_type to a profile category
+    _type_to_category = {
+        "receipt": "finances", "credit_card": "finances", "bank_statement": "finances",
+        "insurance": "insurance", "medical": "health", "legal": "documents",
+        "contract": "documents", "utility": "finances", "tax": "finances",
+        "id_document": "documents", "travel": "travel", "hotel": "travel",
+        "school": "family", "event": "general", "mortgage": "documents",
+    }
+    category = _type_to_category.get(doc_type, "general")
+    if category not in category_map:
+        category = "general"
+
+    entry_summary = (summary[:80] if summary else f"Document stored ({doc_type})")
+    return [{"summary": entry_summary, "content": content, "category": category}]
+
+
+# ---------------------------------------------------------------------------
 # Main ingest function
 # ---------------------------------------------------------------------------
 
@@ -273,6 +315,7 @@ def ingest_document(
     committed_context: dict[str, str],
     profile: dict,
     parser: str | None = None,
+    cm=None,
 ) -> dict[str, Any]:
     """
     Ingest a document file and return structured extraction results.
@@ -282,6 +325,9 @@ def ingest_document(
         committed_context: Current committed context dict (for deduplication hints).
         profile:           Profile dict loaded from profile.json.
         parser:            "claude" or "docling". Defaults to SC_DOCUMENT_PARSER env var.
+        cm:                Optional ContextManager. When provided and the active extension
+                           exposes get_document_schemas(), the full intelligence pipeline
+                           runs (typed Phase A+B extraction) instead of the generic prompt.
 
     Returns:
         {
@@ -291,6 +337,7 @@ def ingest_document(
             "file": str,
             "format": str,
             "parser": str,
+            "doc_type": str | None,    # present when intelligence pipeline ran
         }
     """
     if parser is None:
@@ -311,6 +358,35 @@ def ingest_document(
         }
 
     try:
+        # --- Intelligence pipeline path (when extension provides schemas) ---
+        if cm is not None:
+            try:
+                from .ext_loader import get_document_schemas
+                from . import intelligence
+                schemas = get_document_schemas(cm)
+                if schemas is not None:
+                    file_bytes = filepath.read_bytes()
+                    mime_type = _suffix_to_mime(suffix)
+                    force_vision = os.getenv("SC_FORCE_VISION", "").strip() in ("1", "true", "yes")
+                    result = intelligence.process_document(
+                        file_bytes, filepath.name, mime_type, schemas,
+                        user_language="en", force_vision=force_vision,
+                    )
+                    extractions = _intelligence_result_to_staging(result, profile)
+                    return {
+                        "success": True,
+                        "extractions": extractions,
+                        "error": None,
+                        "file": str(filepath),
+                        "format": suffix,
+                        "parser": "intelligence",
+                        "doc_type": result.get("doc_type"),
+                    }
+            except Exception as e:
+                log.warning(f"Intelligence pipeline failed, falling back to generic: {e}")
+                # fall through to generic path below
+
+        # --- Generic path ---
         text_content = _parse_document_to_text(filepath, api_key, parser)
 
         if text_content is not None:
