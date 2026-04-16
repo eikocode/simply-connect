@@ -341,12 +341,22 @@ class TestDoclingTableExtraction:
     """
 
     @pytest.fixture(scope="class")
-    def table_rows(self, amex_bytes):
-        rows = _ext_intel._extract_docling_tables(amex_bytes)
+    def extraction(self, amex_bytes):
+        """Run _extract_docling_tables() and return (transactions, metadata) tuple."""
+        rows, meta = _ext_intel._extract_docling_tables(amex_bytes)
         print(f"\n[docling_tables] rows extracted: {len(rows)}")
         for r in rows:
             print(f"  {r['date']:12} | {r['description'][:40]:40} | HKD {r['hkd_amount']:>10,.2f}")
-        return rows
+        print(f"\n[docling_tables] metadata: {meta}")
+        return rows, meta
+
+    @pytest.fixture(scope="class")
+    def table_rows(self, extraction):
+        return extraction[0]
+
+    @pytest.fixture(scope="class")
+    def table_meta(self, extraction):
+        return extraction[1]
 
     def test_extracts_multiple_transactions(self, table_rows):
         # April 2026 AE statement has 12 charge transactions; we expect at least 9
@@ -403,8 +413,42 @@ class TestDoclingTableExtraction:
                 f"Raw /CTIU sequence found in description: {row}"
             )
 
-    def test_formatted_text_is_clean(self, table_rows):
-        text = _ext_intel._format_table_transactions(table_rows)
+    # ── Metadata tests ────────────────────────────────────────────────────────
+
+    def test_metadata_cardholder_extracted(self, table_meta):
+        """Cardholder name must be extracted from the xxxx-xxxxxx-NNNNN row."""
+        cardholder = table_meta.get("cardholder")
+        assert cardholder, f"cardholder not extracted: {table_meta}"
+        assert "EIKO" in cardholder.upper(), (
+            f"Expected cardholder to contain 'EIKO', got: {cardholder!r}"
+        )
+
+    def test_metadata_account_suffix_extracted(self, table_meta):
+        """Account suffix (last 5 digits) must be extracted."""
+        suffix = table_meta.get("account_suffix")
+        assert suffix, f"account_suffix not extracted: {table_meta}"
+        assert suffix.isdigit(), f"account_suffix should be numeric digits: {suffix!r}"
+
+    def test_metadata_statement_total_extracted(self, table_meta):
+        """Statement total due must be extracted from the footer row."""
+        total = table_meta.get("statement_total")
+        assert total is not None, f"statement_total not extracted: {table_meta}"
+        # April 2026 AE statement total is 5,258.61 HKD
+        assert abs(total - 5258.61) < 1.0, (
+            f"statement_total={total} differs from expected ~5258.61"
+        )
+
+    def test_metadata_autopay_amount_extracted(self, table_meta):
+        """Autopay payment amount must be extracted from the AUTOPAY CR row."""
+        autopay = table_meta.get("autopay_amount")
+        assert autopay is not None, f"autopay_amount not extracted: {table_meta}"
+        # April 2026 AE autopay amount is 42,453.91 HKD
+        assert abs(autopay - 42453.91) < 1.0, (
+            f"autopay_amount={autopay} differs from expected ~42453.91"
+        )
+
+    def test_formatted_text_is_clean(self, table_rows, table_meta):
+        text = _ext_intel._format_table_transactions(table_rows, table_meta)
         print(f"\n[docling_tables] formatted text:\n{text}")
         assert "HKD Amount" in text, "Missing HKD Amount column header"
         assert "| Date |" in text, "Missing Date column header"
@@ -413,3 +457,10 @@ class TestDoclingTableExtraction:
         )
         assert '/CTIU' not in text, "Raw /CTIU sequences in formatted output"
         assert '7.980' not in text, "Raw FX exchange rate leaked into formatted output"
+
+    def test_formatted_text_includes_metadata(self, table_rows, table_meta):
+        """Formatted preamble must include cardholder, statement total, autopay."""
+        text = _ext_intel._format_table_transactions(table_rows, table_meta)
+        assert "Cardholder:" in text, "Cardholder line missing from formatted output"
+        assert "Statement total due:" in text, "Statement total missing from formatted output"
+        assert "autopay" in text.lower(), "Autopay amount missing from formatted output"
