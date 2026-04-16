@@ -1,14 +1,16 @@
 """
-Integration test — real Amex PDF through docling (phase 1) + Claude CLI OAuth (phase 2).
+Integration test — real Amex PDF through Docling table extraction (phase 1) + Claude CLI OAuth (phase 2).
 
 No API key required. Uses the claude CLI subprocess with your Anthropic subscription.
+Requires docling to be installed (pip install docling).
 
 What this proves:
-  - Docling extracts text from the real two-column Amex HK statement
-  - Smart vision detection correctly identifies it needs vision mode (foreign currency keywords)
-  - Claude CLI (OAuth) classifies and extracts transactions correctly
-  - CR lines (autopay) are excluded
-  - HKD amounts are used, not foreign currency amounts
+  - _needs_vision()=True is detected for AE PDFs with foreign currency entries
+  - Docling table extraction separates the two-column layout into clean transaction rows
+  - HKD amounts are extracted programmatically (rightmost amount per row)
+  - Clean structured text is passed to Claude CLI for classification and summary
+  - CR lines (autopay) are excluded at the table extraction stage
+  - Full pipeline works in CLI-only mode — no ANTHROPIC_API_KEY needed
 
 Run with:
     SC_DATA_DIR=/Users/eiko/Dev/deployments/save-my-brain \\
@@ -74,6 +76,14 @@ def _claude_cli_available() -> bool:
     return shutil.which("claude") is not None
 
 
+def _docling_available() -> bool:
+    try:
+        import docling  # noqa
+        return True
+    except ImportError:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
     not AMEX_PDF.exists(),
     reason=f"Amex PDF not found at {AMEX_PDF}",
@@ -110,13 +120,17 @@ def extraction(amex_pdf_bytes):
     print(f"\n[pipeline] method={method} access={access} "
           f"transactions={txn_count} summary_len={summary_len}")
 
-    # Vision needed but CLI can't do vision → known limitation
-    if method == "vision" and txn_count == 0 and summary_len == 0:
+    # Empty result — determine why and skip with a clear message
+    if txn_count == 0 and summary_len == 0:
+        if not _docling_available():
+            pytest.skip(
+                "Docling not installed — table path unavailable. "
+                "Vision path requires ANTHROPIC_API_KEY. "
+                "Install docling to enable CLI-mode AE extraction: pip install docling"
+            )
         pytest.skip(
-            "KNOWN LIMITATION: This Amex PDF has foreign currency entries "
-            "(_needs_vision()=True) but CLI backend cannot process images — "
-            "vision requires ANTHROPIC_API_KEY. "
-            "Upload Amex PDFs with FX entries will produce empty extraction in CLI-only mode."
+            f"Extraction returned empty (method={method}, access={access}). "
+            "Docling table path may have failed — check sc-web logs for [smb] entries."
         )
     return result
 

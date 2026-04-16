@@ -57,10 +57,13 @@ def _load_direct(full_name: str):
 
 _eyes = _load_direct("simply_connect.eyes")
 
-# Load extension (for _needs_vision)
+# Load extension (for _needs_vision, _extract_docling_tables, _format_table_transactions)
 if str(SC_DATA_DIR) not in sys.path:
     sys.path.insert(0, str(SC_DATA_DIR))
 _ext_intel = importlib.import_module("extension.intelligence")
+
+# Import _MONTH_RE from extension for table row date assertions
+_MONTH_RE = _ext_intel._MONTH_RE
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +325,91 @@ class TestNeedsVision:
         assert result is False, (
             "A simple receipt PDF with no FX keywords should NOT trigger vision"
         )
+
+
+# ---------------------------------------------------------------------------
+# Docling table extraction (new path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _docling_available(), reason="docling not installed")
+class TestDoclingTableExtraction:
+    """Test _extract_docling_tables() and _format_table_transactions() directly.
+
+    These functions implement the new table-extraction path that lets CLI-only
+    mode (no API key) process Amex HK PDFs with foreign currency entries.
+    No Claude, no API key required.
+    """
+
+    @pytest.fixture(scope="class")
+    def table_rows(self, amex_bytes):
+        rows = _ext_intel._extract_docling_tables(amex_bytes)
+        print(f"\n[docling_tables] rows extracted: {len(rows)}")
+        for r in rows:
+            print(f"  {r['date']:12} | {r['description'][:40]:40} | HKD {r['hkd_amount']:>10,.2f}")
+        return rows
+
+    def test_extracts_multiple_transactions(self, table_rows):
+        # April 2026 AE statement has 12 charge transactions; we expect at least 9
+        # (some FX rows with compressed dates like "March3" may vary by Docling version)
+        assert len(table_rows) >= 9, (
+            f"Expected ≥9 transaction rows, got {len(table_rows)}"
+        )
+
+    def test_no_autopay_row(self, table_rows):
+        """The autopay CR payment row must be excluded."""
+        for row in table_rows:
+            assert 'AUTOPAY' not in row['description'].upper(), (
+                f"Autopay CR row was not filtered: {row}"
+            )
+
+    def test_no_cr_row(self, table_rows):
+        """No negative or zero HKD amounts — CR rows must be filtered."""
+        for row in table_rows:
+            assert row['hkd_amount'] > 0, (
+                f"Non-positive HKD amount found (CR row not filtered?): {row}"
+            )
+
+    def test_hkd_amounts_are_reasonable(self, table_rows):
+        """All HKD amounts should be in per-transaction scale (> 1, < 10,000)."""
+        for row in table_rows:
+            assert 1 < row['hkd_amount'] < 10_000, (
+                f"Amount out of reasonable HKD transaction range: {row}"
+            )
+
+    def test_all_rows_have_date(self, table_rows):
+        for row in table_rows:
+            assert _MONTH_RE.search(row['date']), (
+                f"Row missing a valid month-name date: {row}"
+            )
+
+    def test_all_rows_have_description(self, table_rows):
+        for row in table_rows:
+            assert len(row['description']) >= 3, (
+                f"Description too short or empty: {row}"
+            )
+
+    def test_known_transactions_present(self, table_rows):
+        """Spot-check merchants confirmed present in the April 2026 AE statement."""
+        descs = [r['description'].upper() for r in table_rows]
+        # These merchants appear in rows with normal date formatting — reliably extracted
+        assert any('NETFLIX' in d for d in descs), "NETFLIX transaction not found"
+        assert any('FIREFLIES' in d for d in descs), "FIREFLIES.AI transaction not found"
+        assert any('LOOM' in d for d in descs), "LOOM transaction not found"
+
+    def test_no_ctiu_sequences_in_descriptions(self, table_rows):
+        """Docling /CTIUxxxx escape sequences must be cleaned from descriptions."""
+        for row in table_rows:
+            assert '/CTIU' not in row['description'], (
+                f"Raw /CTIU sequence found in description: {row}"
+            )
+
+    def test_formatted_text_is_clean(self, table_rows):
+        text = _ext_intel._format_table_transactions(table_rows)
+        print(f"\n[docling_tables] formatted text:\n{text}")
+        assert "HKD Amount" in text, "Missing HKD Amount column header"
+        assert "| Date |" in text, "Missing Date column header"
+        assert len(text) < 8_000, (
+            f"Formatted text ({len(text)} chars) exceeds CLI 8K limit"
+        )
+        assert '/CTIU' not in text, "Raw /CTIU sequences in formatted output"
+        assert '7.980' not in text, "Raw FX exchange rate leaked into formatted output"
