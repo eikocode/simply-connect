@@ -325,21 +325,27 @@ def process_document(
     user_language: str = "en",
     force_vision: bool = False,
     backend: LLMBackend | None = None,
+    pre_extracted_text: str | None = None,
 ) -> dict[str, Any]:
     """
     Full hybrid document intelligence pipeline.
 
     Args:
-        file_bytes:    Raw bytes of the uploaded file.
-        filename:      Original filename (used for mime detection fallback).
-        mime_type:     MIME type string (e.g. "application/pdf", "image/jpeg").
-        schemas:       Domain schemas dict — must contain:
-                         classify_schema, extraction_schemas, default_extraction_schema,
-                         complex_doc_types, haiku_model, sonnet_model
-        user_language: "en", "zh-tw", "zh", "ja" — controls summary language.
-        force_vision:  Skip EYES and go straight to vision path.
-        backend:       LLMBackend instance. If None, reads SC_LLM_BACKEND env var
-                       (default: AnthropicBackend).
+        file_bytes:          Raw bytes of the uploaded file.
+        filename:            Original filename (used for mime detection fallback).
+        mime_type:           MIME type string (e.g. "application/pdf", "image/jpeg").
+        schemas:             Domain schemas dict — must contain:
+                               classify_schema, extraction_schemas, default_extraction_schema,
+                               complex_doc_types, haiku_model, sonnet_model
+        user_language:       "en", "zh-tw", "zh", "ja" — controls summary language.
+        force_vision:        Skip EYES and go straight to vision path.
+        backend:             LLMBackend instance. If None, reads SC_LLM_BACKEND env var
+                             (default: AnthropicBackend).
+        pre_extracted_text:  Caller-supplied pre-processed text. When provided, skips
+                             the EYES extraction step entirely and uses this text directly
+                             for text-mode classification and extraction. Used by domain
+                             extensions that do their own structured extraction (e.g.
+                             Docling table parsing for two-column credit card statements).
 
     Returns dict with:
         doc_type, summary, key_points, important_dates, red_flags, action_items,
@@ -398,13 +404,21 @@ def process_document(
             "_claude_access": "none",
         }
 
-    # Step 1: EYES
-    eyes_result = eyes.extract_text(file_bytes, mime_type, filename)
-    log.info(
-        f"EYES: method={eyes_result.method} "
-        f"text_len={len(eyes_result.text)} "
-        f"scanned={eyes_result.is_scanned}"
-    )
+    # Step 1: EYES (or use caller-supplied pre-extracted text)
+    if pre_extracted_text is not None:
+        eyes_result = eyes.EyesResult(
+            text=pre_extracted_text,
+            method="pre_extracted",
+            is_scanned=False,
+        )
+        log.info(f"EYES: using pre_extracted_text ({len(pre_extracted_text)} chars)")
+    else:
+        eyes_result = eyes.extract_text(file_bytes, mime_type, filename)
+        log.info(
+            f"EYES: method={eyes_result.method} "
+            f"text_len={len(eyes_result.text)} "
+            f"scanned={eyes_result.is_scanned}"
+        )
     use_text_mode = eyes.has_enough_text(eyes_result) and not force_vision
     extraction_method = "text" if use_text_mode else "vision"
     access = backend.name()
