@@ -257,50 +257,44 @@ class TestEyesPublicAPI:
 # ---------------------------------------------------------------------------
 
 class TestNeedsVision:
-    """Verify _needs_vision() correctly identifies this PDF as requiring vision."""
+    """_needs_vision() now only returns True for image MIME types.
 
-    def test_returns_true_for_amex(self, amex_bytes):
-        result = _ext_intel._needs_vision(amex_bytes, "application/pdf")
-        assert result is True, (
-            "Expected _needs_vision()=True for April 2026 Amex HK PDF "
-            "(foreign currency entries present)"
-        )
+    PDF layout detection has moved to _detect_known_pdf_type().
+    """
 
-    def test_fx_keyword_count_shown(self, amex_bytes):
-        """Informational: print the exact FX keyword count that triggers the flag.
+    def test_returns_true_for_jpeg(self):
+        assert _ext_intel._needs_vision(b"", "image/jpeg") is True
 
-        _needs_vision() returns True when ≥2 foreign currency names are found
-        in the first 5 pages via PyMuPDF. This test reproduces that logic and
-        prints the count so we can see WHY vision fires on this document.
-        """
-        try:
-            import fitz
-        except ImportError:
-            pytest.skip("PyMuPDF not installed")
+    def test_returns_true_for_png(self):
+        assert _ext_intel._needs_vision(b"", "image/png") is True
 
-        fx_pattern = re.compile(
-            r"\b(DOLLAR|EURO|POUND|YEN|FRANC|YUAN|RENMINBI|WON|BAHT|RUPEE|"
-            r"RINGGIT|PESO|KRONA|KRONE|DIRHAM|RIYAL|LIRA|FORINT|ZLOTY)\b",
-            re.IGNORECASE,
-        )
-        doc = fitz.open(stream=amex_bytes, filetype="pdf")
-        full_text = "".join(doc[i].get_text() for i in range(min(len(doc), 5)))
-        doc.close()
+    def test_returns_true_for_webp(self):
+        assert _ext_intel._needs_vision(b"", "image/webp") is True
 
-        matches = fx_pattern.findall(full_text)
-        print(
-            f"\n[_needs_vision] FX keyword matches: {len(matches)}\n"
-            f"  Keywords found: {sorted(set(m.upper() for m in matches))}\n"
-            f"  Threshold: ≥2 → result=True"
-        )
-        assert len(matches) >= 2, (
-            f"Expected ≥2 FX keyword hits to explain why _needs_vision=True, "
-            f"got {len(matches)}: {matches}"
-        )
+    def test_returns_false_for_pdf(self, amex_bytes):
+        """PDFs are never vision-only — they go through EYES or known-type path."""
+        assert _ext_intel._needs_vision(amex_bytes, "application/pdf") is False
 
     def test_returns_false_for_plain_pdf(self):
-        """Sanity check: a simple PDF with no FX keywords must NOT trigger vision."""
-        # Minimal hand-crafted PDF with no currency names
+        assert _ext_intel._needs_vision(b"%PDF-1.4", "application/pdf") is False
+
+
+# ---------------------------------------------------------------------------
+# Document type detection (dispatcher + fingerprint)
+# ---------------------------------------------------------------------------
+
+class TestDocumentTypeDetection:
+    """_detect_known_pdf_type() and _fingerprint_amex_hk() tests."""
+
+    def test_detects_amex_hk(self, amex_bytes):
+        """April 2026 AE PDF must be detected as amex_hk."""
+        result = _ext_intel._detect_known_pdf_type(amex_bytes)
+        assert result == "amex_hk", (
+            f"Expected 'amex_hk', got {result!r}"
+        )
+
+    def test_unknown_pdf_returns_none(self):
+        """A plain PDF with no AE account pattern must return None."""
         content = (
             b"%PDF-1.4\n"
             b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
@@ -321,10 +315,28 @@ class TestNeedsVision:
             b"trailer\n<< /Size 6 /Root 1 0 R >>\n"
             b"startxref\n436\n%%EOF"
         )
-        result = _ext_intel._needs_vision(content, "application/pdf")
-        assert result is False, (
-            "A simple receipt PDF with no FX keywords should NOT trigger vision"
+        result = _ext_intel._detect_known_pdf_type(content)
+        assert result is None, (
+            f"Plain receipt PDF should not match any known type, got {result!r}"
         )
+
+    def test_fingerprint_amex_hk_matches_account_pattern(self):
+        """Fingerprint matches when xxxx-xxxxxx-NNNNN pattern is present."""
+        assert _ext_intel._fingerprint_amex_hk("xxxx-xxxxxx-92001 EIKO ONISHI") is True
+
+    def test_fingerprint_amex_hk_no_match_without_pattern(self):
+        """Fingerprint must not match text without AE account pattern."""
+        assert _ext_intel._fingerprint_amex_hk("DOLLAR DOLLAR EURO YEN") is False
+
+    def test_registry_contains_amex_hk(self):
+        """DOCUMENT_EXTRACTORS must have amex_hk with required keys."""
+        reg = _ext_intel.DOCUMENT_EXTRACTORS
+        assert "amex_hk" in reg, "amex_hk not in DOCUMENT_EXTRACTORS"
+        entry = reg["amex_hk"]
+        assert callable(entry["fingerprint"]), "fingerprint must be callable"
+        assert callable(entry["extractor"]),   "extractor must be callable"
+        assert callable(entry["formatter"]),   "formatter must be callable"
+        assert "label" in entry,               "label key missing"
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +345,9 @@ class TestNeedsVision:
 
 @pytest.mark.skipif(not _docling_available(), reason="docling not installed")
 class TestDoclingTableExtraction:
-    """Test _extract_docling_tables() and _format_table_transactions() directly.
+    """Test _extract_amex_hk_tables() and _format_amex_hk_transactions() directly.
 
-    These functions implement the new table-extraction path that lets CLI-only
+    These functions implement the Amex HK table-extraction path that lets CLI-only
     mode (no API key) process Amex HK PDFs with foreign currency entries.
     No Claude, no API key required.
     """
@@ -343,7 +355,7 @@ class TestDoclingTableExtraction:
     @pytest.fixture(scope="class")
     def extraction(self, amex_bytes):
         """Run _extract_docling_tables() and return (transactions, metadata) tuple."""
-        rows, meta = _ext_intel._extract_docling_tables(amex_bytes)
+        rows, meta = _ext_intel._extract_amex_hk_tables(amex_bytes)
         print(f"\n[docling_tables] rows extracted: {len(rows)}")
         for r in rows:
             print(f"  {r['date']:12} | {r['description'][:40]:40} | HKD {r['hkd_amount']:>10,.2f}")
@@ -448,7 +460,7 @@ class TestDoclingTableExtraction:
         )
 
     def test_formatted_text_is_clean(self, table_rows, table_meta):
-        text = _ext_intel._format_table_transactions(table_rows, table_meta)
+        text = _ext_intel._format_amex_hk_transactions(table_rows, table_meta)
         print(f"\n[docling_tables] formatted text:\n{text}")
         assert "HKD Amount" in text, "Missing HKD Amount column header"
         assert "| Date |" in text, "Missing Date column header"
@@ -460,7 +472,7 @@ class TestDoclingTableExtraction:
 
     def test_formatted_text_includes_metadata(self, table_rows, table_meta):
         """Formatted preamble must include cardholder, statement total, autopay."""
-        text = _ext_intel._format_table_transactions(table_rows, table_meta)
+        text = _ext_intel._format_amex_hk_transactions(table_rows, table_meta)
         assert "Cardholder:" in text, "Cardholder line missing from formatted output"
         assert "Statement total due:" in text, "Statement total missing from formatted output"
         assert "autopay" in text.lower(), "Autopay amount missing from formatted output"
