@@ -26,9 +26,13 @@ Usage:
   python -m simply_connect.web_relay
   sc-web
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -297,6 +301,103 @@ async def handle_context(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Auth helpers (Telegram-pairing login)
+# ---------------------------------------------------------------------------
+
+def _load_db_module():
+    """Load extension/database.py from SC_DATA_DIR."""
+    import importlib.util, sys
+    data_dir = Path(os.getenv("SC_DATA_DIR", ".")).resolve()
+    db_file = data_dir / "extension" / "database.py"
+    if not db_file.exists():
+        raise RuntimeError(f"extension/database.py not found at {db_file}")
+    module_name = "_sc_ext_database"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    # Ensure extension package is importable
+    ext_dir = str(data_dir / "extension")
+    if ext_dir not in sys.path:
+        sys.path.insert(0, ext_dir)
+    spec = importlib.util.spec_from_file_location(module_name, db_file)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _jwt_secret() -> str:
+    """Return a stable secret key: SC_JWT_SECRET env var or derived from SC_DATA_DIR."""
+    secret = os.getenv("SMB_JWT_SECRET") or os.getenv("SC_JWT_SECRET")
+    if secret:
+        return secret
+    # Derive from data dir path — stable across restarts, unique per deployment
+    seed = os.getenv("SC_DATA_DIR", ".").encode()
+    return hashlib.sha256(seed).hexdigest()
+
+
+def _issue_token(telegram_user_id: str) -> str:
+    """Issue a simple HMAC-signed bearer token valid for 30 days."""
+    payload = f"{telegram_user_id}:{int(time.time()) + 86400 * 30}"
+    secret = _jwt_secret().encode()
+    sig = hmac.new(secret, payload.encode(), "sha256").hexdigest()
+    return f"{payload}:{sig}"
+
+
+def _verify_token(token: str) -> str | None:
+    """Verify a bearer token. Returns telegram_user_id or None if invalid/expired."""
+    try:
+        parts = token.rsplit(":", 2)
+        if len(parts) != 3:
+            return None
+        user_id, exp_str, sig = parts
+        payload = f"{user_id}:{exp_str}"
+        secret = _jwt_secret().encode()
+        expected = hmac.new(secret, payload.encode(), "sha256").hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(exp_str) < int(time.time()):
+            return None
+        return user_id
+    except Exception:
+        return None
+
+
+async def handle_auth_request_code(request: Request) -> JSONResponse:
+    """POST /api/auth/request-code — generate a pairing code."""
+    try:
+        db_mod = _load_db_module()
+        code = db_mod.create_auth_code(cm=None)
+        return JSONResponse({"code": code})
+    except Exception as e:
+        log.exception("handle_auth_request_code failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def handle_auth_poll(request: Request) -> JSONResponse:
+    """GET /api/auth/poll?code=SMB-XXXX — poll for pairing completion."""
+    code = request.query_params.get("code", "").strip().upper()
+    if not code:
+        return JSONResponse({"error": "code is required"}, status_code=400)
+    try:
+        db_mod = _load_db_module()
+        result = db_mod.poll_auth_code(cm=None, code=code)
+        if result is None:
+            return JSONResponse({"status": "pending"})
+        telegram_user_id = result["telegram_user_id"]
+        token = _issue_token(telegram_user_id)
+        onboarding_state = _read_onboarding(telegram_user_id)
+        user = {
+            "telegram_user_id": telegram_user_id,
+            "onboarding_complete": onboarding_state.get("completed", False),
+            "first_name": onboarding_state.get("first_name"),
+        }
+        return JSONResponse({"status": "complete", "token": token, "user": user})
+    except Exception as e:
+        log.exception("handle_auth_poll failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -304,6 +405,7 @@ def _build_app(allowed_origins: list[str]) -> Starlette:
     from starlette.routing import Mount
     return Starlette(
         routes=[
+            # No-prefix routes (Telegram relay / internal use)
             Route("/health", handle_health, methods=["GET"]),
             Route("/onboarding/status", handle_onboarding_status, methods=["GET"]),
             Route("/onboarding/complete", handle_onboarding_complete, methods=["POST"]),
@@ -312,6 +414,17 @@ def _build_app(allowed_origins: list[str]) -> Starlette:
             Route("/tool/{name}", handle_tool, methods=["POST"]),
             Route("/context", handle_context, methods=["GET"]),
             Route("/context/{category}", handle_context, methods=["GET"]),
+            # /api/* routes — used by the web frontend (mcp.js)
+            Route("/api/health", handle_health, methods=["GET"]),
+            Route("/api/auth/request-code", handle_auth_request_code, methods=["POST"]),
+            Route("/api/auth/poll", handle_auth_poll, methods=["GET"]),
+            Route("/api/onboarding/status", handle_onboarding_status, methods=["GET"]),
+            Route("/api/onboarding/complete", handle_onboarding_complete, methods=["POST"]),
+            Route("/api/chat", handle_chat, methods=["POST"]),
+            Route("/api/upload", handle_upload, methods=["POST"]),
+            Route("/api/tool/{name}", handle_tool, methods=["POST"]),
+            Route("/api/context", handle_context, methods=["GET"]),
+            Route("/api/context/{category}", handle_context, methods=["GET"]),
         ],
         middleware=[
             Middleware(

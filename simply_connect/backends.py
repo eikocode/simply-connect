@@ -25,6 +25,33 @@ from typing import Protocol, runtime_checkable
 
 log = logging.getLogger(__name__)
 
+# Pricing per million tokens (as of 2025-04)
+_PRICING: dict[str, tuple[float, float]] = {
+    # model-prefix → (input $/M, output $/M)
+    "claude-opus-4":    (15.0,  75.0),
+    "claude-sonnet-4":  ( 3.0,  15.0),
+    "claude-sonnet-3":  ( 3.0,  15.0),
+    "claude-haiku-4":   ( 0.80,  4.0),
+    "claude-haiku-3":   ( 0.25,  1.25),
+}
+
+def _log_api_cost(call_type: str, model: str, usage) -> None:
+    """Log token usage and estimated cost for one API call."""
+    try:
+        inp = getattr(usage, "input_tokens", 0) or 0
+        out = getattr(usage, "output_tokens", 0) or 0
+        price_in, price_out = next(
+            (v for k, v in _PRICING.items() if model.startswith(k)),
+            (3.0, 15.0),  # default to Sonnet pricing
+        )
+        cost = (inp * price_in + out * price_out) / 1_000_000
+        log.info(
+            "[cost] %s | model=%s | in=%d out=%d tokens | $%.4f USD",
+            call_type, model, inp, out, cost,
+        )
+    except Exception:
+        pass  # never let logging break a completion
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -140,20 +167,30 @@ class AnthropicBackend:
             raise RuntimeError(
                 "AnthropicBackend.complete_vision(): ANTHROPIC_API_KEY required for vision"
             )
-        media_type = mime_type if mime_type in (
-            "image/jpeg", "image/png", "image/gif", "image/webp"
-        ) else "image/jpeg"
-        content = [
-            {
+        b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+        if mime_type == "application/pdf":
+            # PDFs must use the document content block, not image
+            file_block = {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": b64,
+                },
+            }
+        else:
+            media_type = mime_type if mime_type in (
+                "image/jpeg", "image/png", "image/gif", "image/webp"
+            ) else "image/jpeg"
+            file_block = {
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": media_type,
-                    "data": base64.standard_b64encode(file_bytes).decode("utf-8"),
+                    "data": b64,
                 },
-            },
-            {"type": "text", "text": prompt},
-        ]
+            }
+        content = [file_block, {"type": "text", "text": prompt}]
         import anthropic
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = client.messages.create(
@@ -162,6 +199,7 @@ class AnthropicBackend:
             system=system,
             messages=[{"role": "user", "content": content}],
         )
+        _log_api_cost("complete_vision", model, resp.usage)
         return resp.content[0].text
 
     # ---- internal ----
@@ -177,6 +215,7 @@ class AnthropicBackend:
             system=system,
             messages=[{"role": "user", "content": user_text}],
         )
+        _log_api_cost("complete", model, resp.usage)
         return resp.content[0].text
 
     def _sanitise(self, text: str) -> str:

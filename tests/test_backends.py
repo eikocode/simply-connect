@@ -254,8 +254,8 @@ class TestAnthropicCompleteVision:
         assert content[0]["source"]["type"] == "base64"
         assert content[0]["source"]["media_type"] == "image/jpeg"
 
-    def test_vision_normalises_unknown_mime_to_jpeg(self):
-        """Non-image MIME types (e.g. PDF) fall back to image/jpeg for the media_type."""
+    def test_vision_pdf_uses_document_block_not_image(self):
+        """PDFs must use type=document — sending as image/jpeg caused Anthropic 500 errors."""
         b = AnthropicBackend()
         mock_response = self._make_mock_response("{}")
 
@@ -268,9 +268,27 @@ class TestAnthropicCompleteVision:
                 mock_client.messages.create.return_value = mock_response
 
                 b.complete_vision("sys", b"pdf-bytes", "application/pdf", "prompt", "claude-haiku-4-5")
-                call_kwargs = mock_client.messages.create.call_args.kwargs
-                media_type = call_kwargs["messages"][0]["content"][0]["source"]["media_type"]
-                assert media_type == "image/jpeg"
+                content_block = mock_client.messages.create.call_args.kwargs["messages"][0]["content"][0]
+                assert content_block["type"] == "document"
+                assert content_block["source"]["media_type"] == "application/pdf"
+
+    def test_vision_normalises_unknown_mime_to_jpeg(self):
+        """Non-image, non-PDF MIME types fall back to image/jpeg."""
+        b = AnthropicBackend()
+        mock_response = self._make_mock_response("{}")
+
+        with patch.object(b, "_has_api_key", return_value=True), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            import anthropic as _anthropic
+            with patch.object(_anthropic, "Anthropic") as MockAnthropic:
+                mock_client = MagicMock()
+                MockAnthropic.return_value = mock_client
+                mock_client.messages.create.return_value = mock_response
+
+                b.complete_vision("sys", b"unknown", "application/octet-stream", "prompt", "claude-haiku-4-5")
+                content_block = mock_client.messages.create.call_args.kwargs["messages"][0]["content"][0]
+                assert content_block["type"] == "image"
+                assert content_block["source"]["media_type"] == "image/jpeg"
 
 
 # ---------------------------------------------------------------------------

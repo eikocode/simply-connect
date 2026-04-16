@@ -32,6 +32,11 @@ import requests
 from .config import config
 from .runtimes import get_runtime
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
 
@@ -403,10 +408,13 @@ class TelegramRelay:
         """Validate, download, and enqueue a document for background processing."""
         caption = message.get("caption", "")
 
+        _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+
         if "photo" in message:
             file_id = message["photo"][-1]["file_id"]
             mime_type = "image/jpeg"
             filename = "photo"
+            file_size = message["photo"][-1].get("file_size", 0)
         elif "document" in message:
             doc = message["document"]
             mime_type = doc.get("mime_type", "")
@@ -420,7 +428,17 @@ class TelegramRelay:
             file_id = doc["file_id"]
             suffix = _MIME_TO_SUFFIX.get(mime_type, ".bin")
             filename = doc.get("file_name", f"document{suffix}")
+            file_size = doc.get("file_size", 0)
         else:
+            return
+
+        if file_size > _MAX_FILE_BYTES:
+            mb = file_size / 1024 / 1024
+            self.send_message(
+                chat_id,
+                f"⚠️ File too large ({mb:.1f} MB). Maximum is 5 MB per upload.\n\n"
+                "For large documents, please scan only the relevant pages.",
+            )
             return
 
         try:
